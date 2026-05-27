@@ -4,6 +4,11 @@ Fork of [akopytov/sysbench](https://github.com/akopytov/sysbench) with native
 Firebird database support. Run the same industry-standard OLTP benchmarks used
 for MySQL and PostgreSQL against Firebird 3, 4, and 5.
 
+> **Note:** This branch (`firebird-isc`) uses the legacy ISC API (`ibase.h`),
+> which works across Firebird 2.5 through 5.x. The `master` branch will contain
+> the OO API driver (Firebird 3+ only) with Batch API support and lower
+> per-query overhead. The ISC driver is maintained for backward compatibility.
+
 ## Quick Start
 
 ```bash
