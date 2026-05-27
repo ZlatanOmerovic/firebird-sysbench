@@ -5,12 +5,12 @@ jobs:
   build:
     strategy:
       matrix:
-        os: [ ubuntu-22.04, ubuntu-20.04 ]
+        os: [ ubuntu-22.04, ubuntu-24.04 ]
     runs-on: ${{ matrix.os }}
     name: Build on ${{ matrix.os }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
       - name: Autogen
         run: ./autogen.sh
       - name: Configure
@@ -36,7 +36,7 @@ jobs:
       - name: Setup MariaDB Libs
         run: sudo apt install libmariadb-dev libmariadb-dev-compat
       - name: Checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
       - name: Autogen
         run: ./autogen.sh
       - name: Configure
@@ -49,3 +49,59 @@ jobs:
         run: ./src/sysbench --version
       - name: Test
         run: make test
+
+  build_firebird:
+    runs-on: ubuntu-24.04
+    name: Build with Firebird 5
+    steps:
+      - name: Install Firebird 5 dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential autoconf automake libtool libtool-bin pkg-config
+          sudo apt-get install -y libicu-dev zlib1g-dev libedit-dev libncurses-dev unzip
+      - name: Build Firebird 5 from source
+        run: |
+          git clone --depth 1 --branch v5.0.4 https://github.com/FirebirdSQL/firebird.git /tmp/firebird-src
+          cd /tmp/firebird-src
+          ./autogen.sh --prefix=/opt/firebird --with-system-editline --with-system-icu --with-builtin-tommath --with-builtin-tomcrypt
+          make -j$(nproc)
+          sudo make install
+          echo "/opt/firebird/lib" | sudo tee /etc/ld.so.conf.d/firebird.conf
+          sudo ldconfig
+      - name: Verify Firebird
+        run: /opt/firebird/bin/firebird -z
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Autogen
+        run: ./autogen.sh
+      - name: Configure
+        run: ./configure --without-mysql --without-pgsql --with-firebird=/opt/firebird
+      - name: Build
+        run: make -j$(nproc)
+      - name: Sysbench version
+        run: ./src/sysbench --version
+      - name: Show Firebird driver
+        run: ./src/sysbench --help | grep -A4 "firebird"
+      - name: Setup Firebird server
+        run: |
+          sudo /opt/firebird/bin/fbguard -daemon -forever
+          sleep 2
+          /opt/firebird/bin/isql -user SYSDBA -password masterkey <<< "CREATE DATABASE 'localhost:/tmp/sbtest.fdb' USER 'SYSDBA' PASSWORD 'masterkey' DEFAULT CHARACTER SET UTF8; QUIT;"
+      - name: Test prepare
+        run: |
+          ./src/sysbench ./src/lua/oltp_read_write.lua \
+            --db-driver=firebird --firebird-db=localhost:/tmp/sbtest.fdb \
+            --firebird-user=SYSDBA --firebird-password=masterkey \
+            --tables=4 --table-size=1000 prepare
+      - name: Test run
+        run: |
+          ./src/sysbench ./src/lua/oltp_read_write.lua \
+            --db-driver=firebird --firebird-db=localhost:/tmp/sbtest.fdb \
+            --firebird-user=SYSDBA --firebird-password=masterkey \
+            --tables=4 --table-size=1000 --threads=4 --time=10 run
+      - name: Test cleanup
+        run: |
+          ./src/sysbench ./src/lua/oltp_read_write.lua \
+            --db-driver=firebird --firebird-db=localhost:/tmp/sbtest.fdb \
+            --firebird-user=SYSDBA --firebird-password=masterkey \
+            --tables=4 cleanup

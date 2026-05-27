@@ -52,6 +52,8 @@ static sb_list_t        drivers;          /* list of available DB drivers */
 
 static uint8_t stats_enabled;
 
+static int bulk_single_row;
+
 static bool db_global_initialized;
 static pthread_once_t db_global_once = PTHREAD_ONCE_INIT;
 
@@ -102,6 +104,9 @@ int db_register(void)
 #endif
 #ifdef USE_PGSQL
   register_driver_pgsql(&drivers);
+#endif
+#ifdef USE_FIREBIRD
+  register_driver_firebird(&drivers);
 #endif
 
   /* Register command line options for each driver */
@@ -955,13 +960,14 @@ int db_bulk_insert_init(db_conn_t *con, const char *query, size_t query_len)
   con->bulk_buffer = (char *)malloc(con->bulk_buflen);
   if (con->bulk_buffer == NULL)
     return 1;
-  
+
   con->bulk_commit_max = driver_caps.needs_commit ? ROWS_BEFORE_COMMIT : 0;
   con->bulk_commit_cnt = 0;
   strcpy(con->bulk_buffer, query);
   con->bulk_ptr = query_len;
   con->bulk_values = query_len;
   con->bulk_cnt = 0;
+  bulk_single_row = !driver_caps.multi_rows_insert;
 
   return 0;
 }
@@ -1018,6 +1024,12 @@ int db_bulk_insert_next(db_conn_t *con, const char *query, size_t query_len)
 
   con->bulk_cnt++;
 
+  if (bulk_single_row)
+  {
+    if (db_bulk_do_insert(con, 0))
+      return 1;
+  }
+
   return 0;
 }
 
@@ -1029,7 +1041,7 @@ static int db_bulk_do_insert(db_conn_t *con, int is_last)
     return 0;
 
   if (db_query(con, con->bulk_buffer, con->bulk_ptr) == NULL &&
-      con->error != DB_ERROR_NONE)
+      con->error == DB_ERROR_FATAL)
     return 1;
 
 
@@ -1040,7 +1052,7 @@ static int db_bulk_do_insert(db_conn_t *con, int is_last)
     if (is_last || con->bulk_commit_cnt >= con->bulk_commit_max)
     {
       if (db_query(con, "COMMIT", 6) == NULL &&
-          con->error != DB_ERROR_NONE)
+          con->error == DB_ERROR_FATAL)
         return 1;
       con->bulk_commit_cnt = 0;
     }
