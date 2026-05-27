@@ -73,6 +73,10 @@ typedef struct
   XSQLDA           *out_sqlda;
   int              nparams;
   char             prepared;
+  uint32_t         nfields;
+  char             cursor_open;
+  db_value_t       *cached_values;
+  char             **conv_bufs;
 } fb_stmt_t;
 
 typedef struct
@@ -229,6 +233,83 @@ static int fb_allocate_output_buffers(XSQLDA *sqlda)
   }
 
   return 0;
+}
+
+static void fb_extract_column_fast(XSQLVAR *var, db_value_t *val, char *conv_buf)
+{
+  if ((var->sqltype & 1) && var->sqlind && *var->sqlind == -1)
+  {
+    val->ptr = NULL;
+    val->len = 0;
+    return;
+  }
+
+  short dtype = var->sqltype & ~1;
+
+  switch (dtype)
+  {
+  case SQL_TEXT:
+  {
+    int len = var->sqllen;
+    while (len > 0 && var->sqldata[len - 1] == ' ')
+      len--;
+    val->ptr = var->sqldata;
+    val->len = (uint32_t)len;
+    return;
+  }
+  case SQL_VARYING:
+  {
+    ISC_USHORT vary_len;
+    memcpy(&vary_len, var->sqldata, sizeof(ISC_USHORT));
+    val->ptr = var->sqldata + sizeof(ISC_USHORT);
+    val->len = vary_len;
+    return;
+  }
+  case SQL_SHORT:
+  {
+    short v;
+    memcpy(&v, var->sqldata, sizeof(short));
+    val->len = (uint32_t)snprintf(conv_buf, MAX_COLUMN_LENGTH, "%d", (int)v);
+    val->ptr = conv_buf;
+    return;
+  }
+  case SQL_LONG:
+  {
+    ISC_LONG v;
+    memcpy(&v, var->sqldata, sizeof(ISC_LONG));
+    val->len = (uint32_t)snprintf(conv_buf, MAX_COLUMN_LENGTH, "%d", (int)v);
+    val->ptr = conv_buf;
+    return;
+  }
+  case SQL_INT64:
+  {
+    ISC_INT64 v;
+    memcpy(&v, var->sqldata, sizeof(ISC_INT64));
+    val->len = (uint32_t)snprintf(conv_buf, MAX_COLUMN_LENGTH, "%" PRId64, (int64_t)v);
+    val->ptr = conv_buf;
+    return;
+  }
+  case SQL_FLOAT:
+  {
+    float v;
+    memcpy(&v, var->sqldata, sizeof(float));
+    val->len = (uint32_t)snprintf(conv_buf, MAX_COLUMN_LENGTH, "%g", (double)v);
+    val->ptr = conv_buf;
+    return;
+  }
+  case SQL_DOUBLE:
+  {
+    double v;
+    memcpy(&v, var->sqldata, sizeof(double));
+    val->len = (uint32_t)snprintf(conv_buf, MAX_COLUMN_LENGTH, "%g", v);
+    val->ptr = conv_buf;
+    return;
+  }
+  default:
+    val->len = (uint32_t)snprintf(conv_buf, MAX_COLUMN_LENGTH, "?");
+    val->ptr = conv_buf;
+    return;
+  }
 }
 
 static char *fb_extract_column(XSQLVAR *var, uint32_t *out_len)
@@ -690,7 +771,22 @@ int firebird_drv_prepare(db_stmt_t *stmt, const char *query, size_t len)
   }
 
   fbstmt->nparams = fbstmt->in_sqlda->sqld;
+  fbstmt->nfields = (uint32_t)fbstmt->out_sqlda->sqld;
   fbstmt->prepared = 1;
+
+  if (fbstmt->nfields > 0)
+  {
+    fbstmt->cached_values = (db_value_t *)calloc(fbstmt->nfields, sizeof(db_value_t));
+    fbstmt->conv_bufs = (char **)calloc(fbstmt->nfields, sizeof(char *));
+    if (fbstmt->cached_values == NULL || fbstmt->conv_bufs == NULL)
+      goto error;
+    for (uint32_t i = 0; i < fbstmt->nfields; i++)
+    {
+      fbstmt->conv_bufs[i] = (char *)malloc(MAX_COLUMN_LENGTH);
+      if (fbstmt->conv_bufs[i] == NULL)
+        goto error;
+    }
+  }
 
   for (int i = 0; i < fbstmt->nparams; i++)
   {
@@ -721,6 +817,13 @@ error:
       }
       free(fbstmt->in_sqlda);
     }
+    if (fbstmt->conv_bufs != NULL)
+    {
+      for (uint32_t i = 0; i < fbstmt->nfields; i++)
+        if (fbstmt->conv_bufs[i]) free(fbstmt->conv_bufs[i]);
+      free(fbstmt->conv_bufs);
+    }
+    free(fbstmt->cached_values);
     if (fbstmt->out_sqlda != NULL)
     {
       fb_free_sqlda_buffers(fbstmt->out_sqlda);
@@ -890,6 +993,12 @@ db_error_t firebird_drv_execute(db_stmt_t *stmt, db_result_t *rs)
       return DB_ERROR_FATAL;
     }
 
+    if (fbstmt->cursor_open)
+    {
+      isc_dsql_free_statement(status, &fbstmt->stmt, DSQL_close);
+      fbstmt->cursor_open = 0;
+    }
+
     for (i = 0; i < (unsigned)fbstmt->nparams; i++)
       fb_set_param(&fbstmt->in_sqlda->sqlvar[i], &stmt->bound_param[i]);
 
@@ -901,22 +1010,38 @@ db_error_t firebird_drv_execute(db_stmt_t *stmt, db_result_t *rs)
       return fb_check_error(con, status, "isc_dsql_execute", stmt->query,
                             &rs->counter);
 
-    if (fbstmt->out_sqlda->sqld > 0)
+    if (fbstmt->nfields > 0)
     {
       rs->counter = SB_CNT_READ;
 
-      uint32_t total_rows = 0;
-      fb_result_t *fbrs = fb_fetch_all_rows(fbstmt->out_sqlda, &fbstmt->stmt,
-                                             status, &total_rows);
-      if (fbrs == NULL)
-        return DB_ERROR_FATAL;
+      ISC_STATUS fetch_stat;
+      uint32_t row_count = 0;
 
-      fbrs->owns_stmt = 0;
-      rs->nrows = total_rows;
-      rs->nfields = fbrs->nfields;
-      rs->ptr = fbrs;
+      fetch_stat = isc_dsql_fetch(status, &fbstmt->stmt, SQL_DIALECT_V6,
+                                   fbstmt->out_sqlda);
 
-      isc_dsql_free_statement(status, &fbstmt->stmt, DSQL_close);
+      if (fetch_stat == 0)
+      {
+        for (uint32_t ci = 0; ci < fbstmt->nfields; ci++)
+          fb_extract_column_fast(&fbstmt->out_sqlda->sqlvar[ci],
+                                 &fbstmt->cached_values[ci],
+                                 fbstmt->conv_bufs[ci]);
+        row_count = 1;
+
+        while ((fetch_stat = isc_dsql_fetch(status, &fbstmt->stmt,
+                                             SQL_DIALECT_V6,
+                                             fbstmt->out_sqlda)) == 0)
+          row_count++;
+      }
+
+      if (fetch_stat != 100 && fetch_stat != 0)
+        return fb_check_error(con, status, "isc_dsql_fetch", stmt->query,
+                              &rs->counter);
+
+      fbstmt->cursor_open = 1;
+      rs->nrows = row_count;
+      rs->nfields = fbstmt->nfields;
+      rs->ptr = fbstmt;
 
       return DB_ERROR_NONE;
     }
@@ -1260,20 +1385,31 @@ int firebird_drv_fetch(db_result_t *rs)
 
 int firebird_drv_fetch_row(db_result_t *rs, db_row_t *row)
 {
-  fb_result_t *fbrs = (fb_result_t *)rs->ptr;
-
-  if (fbrs == NULL)
+  if (rs->ptr == NULL)
     return DB_ERROR_IGNORABLE;
 
   intptr_t rownum = (intptr_t)row->ptr;
-  if (rownum >= (intptr_t)fbrs->nrows)
+  if (rownum >= (intptr_t)rs->nrows)
     return DB_ERROR_IGNORABLE;
 
-  db_value_t *src = &fbrs->values[rownum * fbrs->nfields];
-  for (uint32_t i = 0; i < fbrs->nfields; i++)
+  if (rs->statement != NULL && rs->statement->emulated == 0)
   {
-    row->values[i].len = src[i].len;
-    row->values[i].ptr = src[i].ptr;
+    fb_stmt_t *fbstmt = (fb_stmt_t *)rs->statement->ptr;
+    for (uint32_t i = 0; i < fbstmt->nfields; i++)
+    {
+      row->values[i].len = fbstmt->cached_values[i].len;
+      row->values[i].ptr = fbstmt->cached_values[i].ptr;
+    }
+  }
+  else
+  {
+    fb_result_t *fbrs = (fb_result_t *)rs->ptr;
+    db_value_t *src = &fbrs->values[rownum * fbrs->nfields];
+    for (uint32_t i = 0; i < fbrs->nfields; i++)
+    {
+      row->values[i].len = src[i].len;
+      row->values[i].ptr = src[i].ptr;
+    }
   }
 
   row->ptr = (void *)(rownum + 1);
@@ -1284,6 +1420,13 @@ int firebird_drv_fetch_row(db_result_t *rs, db_row_t *row)
 
 int firebird_drv_free_results(db_result_t *rs)
 {
+  if (rs->statement != NULL && rs->statement->emulated == 0)
+  {
+    rs->ptr = NULL;
+    rs->row.ptr = 0;
+    return 0;
+  }
+
   fb_result_t *fbrs = (fb_result_t *)rs->ptr;
 
   if (fbrs != NULL)
@@ -1314,6 +1457,14 @@ int firebird_drv_close(db_stmt_t *stmt)
     }
     free(fbstmt->in_sqlda);
   }
+
+  if (fbstmt->conv_bufs != NULL)
+  {
+    for (uint32_t i = 0; i < fbstmt->nfields; i++)
+      free(fbstmt->conv_bufs[i]);
+    free(fbstmt->conv_bufs);
+  }
+  free(fbstmt->cached_values);
 
   if (fbstmt->out_sqlda != NULL)
   {
