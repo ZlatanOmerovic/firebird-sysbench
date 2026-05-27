@@ -84,6 +84,7 @@ jobs:
         run: ./src/sysbench --help | grep -A4 "firebird"
       - name: Setup Firebird server
         run: |
+          /opt/firebird/bin/isql -user SYSDBA /opt/firebird/security5.fdb <<< "CREATE USER SYSDBA PASSWORD 'masterkey' USING PLUGIN Srp; COMMIT; QUIT;"
           sudo /opt/firebird/bin/fbguard -daemon -forever
           sleep 2
           /opt/firebird/bin/isql -user SYSDBA -password masterkey <<< "CREATE DATABASE 'localhost:/tmp/sbtest.fdb' USER 'SYSDBA' PASSWORD 'masterkey' DEFAULT CHARACTER SET UTF8; QUIT;"
