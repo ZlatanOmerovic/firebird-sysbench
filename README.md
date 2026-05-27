@@ -1,310 +1,164 @@
-[![Latest Release][release-badge]][release-url]
-[![Build Status][action-badge]][action-url]
-[![Debian Packages][deb-badge]][deb-url]
-[![RPM Packages][rpm-badge]][rpm-url]
-[![Coverage Status][coveralls-badge]][coveralls-url]
-[![License][license-badge]][license-url]
+# sysbench — Firebird Edition
 
-<!-- markdown-toc start - Don't edit this section. Run M-x markdown-toc-generate-toc again -->
-**Table of Contents**
+Fork of [akopytov/sysbench](https://github.com/akopytov/sysbench) with native
+Firebird database support. Run the same industry-standard OLTP benchmarks used
+for MySQL and PostgreSQL against Firebird 3, 4, and 5.
 
-- [sysbench](#sysbench)
-    - [Features](#features)
-- [Installing from Binary Packages](#installing-from-binary-packages)
-    - [Linux](#linux)
-    - [macOS](#macos)
-    - [Windows](#windows)
-- [Building and Installing From Source](#building-and-installing-from-source)
-    - [Build Requirements](#build-requirements)
-        - [Windows](#windows)
-        - [Debian/Ubuntu](#debianubuntu)
-        - [RHEL/CentOS](#rhelcentos)
-        - [Fedora](#fedora)
-        - [macOS](#macos)
-    - [Build and Install](#build-and-install)
-- [Usage](#usage)
-    - [General Syntax](#general-syntax)
-    - [General Command Line Options](#general-command-line-options)
-    - [Random Numbers Options](#random-numbers-options)
-- [Versioning](#versioning)
+## Quick Start
 
-<!-- markdown-toc end -->
+```bash
+# Build
+./autogen.sh
+./configure --with-firebird=/opt/firebird
+make -j$(nproc)
 
-# sysbench
+# Create a test database (using Firebird's isql)
+isql -user SYSDBA -password masterkey <<< "CREATE DATABASE 'localhost:/tmp/sbtest.fdb' USER 'SYSDBA' PASSWORD 'masterkey' DEFAULT CHARACTER SET UTF8; QUIT;"
 
-sysbench is a scriptable multi-threaded benchmark tool based on
-LuaJIT. It is most frequently used for database benchmarks, but can also
-be used to create arbitrarily complex workloads that do not involve a
-database server.
+# Prepare, run, cleanup
+./src/sysbench ./src/lua/oltp_read_write.lua \
+  --db-driver=firebird \
+  --firebird-db=localhost:/tmp/sbtest.fdb \
+  --firebird-user=SYSDBA \
+  --firebird-password=masterkey \
+  --tables=4 --table-size=10000 prepare
 
-sysbench comes with the following bundled benchmarks:
+./src/sysbench ./src/lua/oltp_read_write.lua \
+  --db-driver=firebird \
+  --firebird-db=localhost:/tmp/sbtest.fdb \
+  --firebird-user=SYSDBA \
+  --firebird-password=masterkey \
+  --tables=4 --table-size=10000 --threads=4 --time=10 run
 
-- `oltp_*.lua`: a collection of OLTP-like database benchmarks
-- `fileio`: a filesystem-level benchmark
-- `cpu`: a simple CPU benchmark
-- `memory`: a memory access benchmark
-- `threads`: a thread-based scheduler benchmark
-- `mutex`: a POSIX mutex benchmark
-
-## Features
-
-- extensive statistics about rate and latency is available, including
-  latency percentiles and histograms;
-- low overhead even with thousands of concurrent threads. sysbench is
-  capable of generating and tracking hundreds of millions of events per
-  second;
-- new benchmarks can be easily created by implementing pre-defined hooks
-  in user-provided Lua scripts;
-- can be used as a general-purpose Lua interpreter as well, simply
-  replace `#!/usr/bin/lua` with `#!/usr/bin/sysbench` in your script.
-
-# Installing from Binary Packages
-
-## Linux
-
-The easiest way to download and install sysbench on Linux is using
-binary package repositories hosted by
-[packagecloud](https://packagecloud.io). The repositories are
-automatically updated on each sysbench release. Currently x86_64, i386
-and aarch64 binaries are available.
-
-Multiple methods to download and install sysbench packages are available and
-described at <https://packagecloud.io/akopytov/sysbench/install>.
-
-Quick install instructions:
-
-- Debian/Ubuntu
-  ``` shell
-  curl -s https://packagecloud.io/install/repositories/akopytov/sysbench/script.deb.sh | sudo bash
-  sudo apt -y install sysbench
-  ```
-
-- RHEL/CentOS:
-  ``` shell
-  curl -s https://packagecloud.io/install/repositories/akopytov/sysbench/script.rpm.sh | sudo bash
-  sudo yum -y install sysbench
-  ```
-
-- Fedora:
-  ``` shell
-  curl -s https://packagecloud.io/install/repositories/akopytov/sysbench/script.rpm.sh | sudo bash	
-  sudo dnf -y install sysbench
-  ```
-
-- Arch Linux:
-  ``` shell
-  sudo pacman -Suy sysbench
-  ```
-
-## macOS
-
-On macOS, up-to-date sysbench packages are available from Homebrew:
-```shell
-# Add --with-postgresql if you need PostgreSQL support
-brew install sysbench
+./src/sysbench ./src/lua/oltp_read_write.lua \
+  --db-driver=firebird \
+  --firebird-db=localhost:/tmp/sbtest.fdb \
+  --firebird-user=SYSDBA \
+  --firebird-password=masterkey \
+  --tables=4 cleanup
 ```
 
-## Windows
-As of sysbench 1.0 support for native Windows builds was dropped. It may
-be re-introduced in later releases. Currently, the recommended way to
-obtain sysbench on Windows is
-using
-[Windows Subsystem for Linux available in Windows 10](https://msdn.microsoft.com/en-us/commandline/wsl/about).
+## Firebird Driver Options
 
-After installing WSL and getting into he bash prompt on Windows
-following Debian/Ubuntu installation instructions is
-sufficient. Alternatively, one can use WSL to build and install sysbench
-from source, or use an older sysbench release to build a native binary.
-
-# Building and Installing From Source
-
-It is recommended to install sysbench from the official binary
-packages as described in
-[Installing from Binary Packages](#installing-from-binary-packages). Below
-are instruction for cases when you want to use sysbench on an
-architecture for which no binary packages are available.
-
-## Build Requirements
-
-### Windows
-As of sysbench 1.0 support for native Windows builds was
-dropped. It may be re-introduced in later versions. Currently, the
-recommended way to build sysbench on Windows is using
-[Windows Subsystem for Linux available in Windows 10](https://msdn.microsoft.com/en-us/commandline/wsl/about).
-
-After installing WSL and getting into bash prompt on Windows, following
-Debian/Ubuntu build instructions is sufficient. Alternatively, one can
-build and use an older 0.5 release on Windows.
-
-### Debian/Ubuntu
-``` shell
-    apt -y install make automake libtool pkg-config libaio-dev
-    # For MySQL support
-    apt -y install libmysqlclient-dev libssl-dev
-    # For PostgreSQL support
-    apt -y install libpq-dev
+```
+--firebird-db        Database connection string (e.g., localhost:/tmp/sbtest.fdb)
+--firebird-user      User name (default: SYSDBA)
+--firebird-password  Password (default: masterkey)
 ```
 
-### RHEL/CentOS
-``` shell
-    yum -y install make automake libtool pkgconfig libaio-devel
-    # For MySQL support, replace with mysql-devel on RHEL/CentOS 5
-    yum -y install mariadb-devel openssl-devel
-    # For PostgreSQL support
-    yum -y install postgresql-devel
+For non-default ports: `--firebird-db=localhost/3054:/tmp/sbtest.fdb`
+
+## Supported Benchmarks
+
+All standard sysbench OLTP benchmarks work with Firebird:
+
+| Script | Description |
+|---|---|
+| `oltp_point_select` | Single-row SELECT by primary key |
+| `oltp_read_only` | Read-only mix: point selects, range scans, SUM, ORDER BY, DISTINCT |
+| `oltp_read_write` | Mixed read/write OLTP workload (the flagship benchmark) |
+| `oltp_insert` | INSERT-only workload |
+| `oltp_delete` | DELETE-only workload |
+| `oltp_update_index` | UPDATE on indexed column |
+| `oltp_update_non_index` | UPDATE on non-indexed column |
+| `select_random_points` | SELECT with random IN() clause |
+| `select_random_ranges` | SELECT with random BETWEEN ranges |
+| `bulk_insert` | Bulk INSERT throughput |
+
+## Supported Firebird Versions
+
+The driver uses the legacy ISC API (`ibase.h`) which is stable across all
+modern Firebird versions. Tested and verified against:
+
+- **Firebird 5.0.4** — full support, all tests pass
+- **Firebird 4.0.7** — full support, all tests pass
+- **Firebird 3.0.14** — full support, all benchmarks pass
+
+## Building with Multiple Drivers
+
+sysbench can be built with MySQL, PostgreSQL, and Firebird simultaneously:
+
+```bash
+./configure --with-mysql --with-pgsql --with-firebird=/opt/firebird
+make -j$(nproc)
 ```
 
-### Fedora
-``` shell
-    dnf -y install make automake libtool pkgconfig libaio-devel
-    # For MySQL support
-    dnf -y install mariadb-devel openssl-devel
-    # For PostgreSQL support
-    dnf -y install postgresql-devel
+This produces a single binary that supports all three databases, enabling
+direct A/B/C comparisons on identical hardware.
+
+## Benchmark Scripts
+
+Two helper scripts are included for running complete benchmark suites:
+
+```bash
+# Full suite (10 benchmarks, cleanup+prepare before each)
+./run_benchmarks.sh firebird
+./run_benchmarks.sh mysql
+./run_benchmarks.sh pgsql
+
+# Read-safe suite (5 benchmarks, single prepare)
+./run_benchmarks_readonly.sh firebird
+
+# Custom Firebird connection
+FIREBIRD_DB=localhost/3054:/tmp/sbtest.fdb ./run_benchmarks.sh firebird
+
+# Custom parameters
+THREADS=8 TIME=30 TABLE_SIZE=100000 ./run_benchmarks.sh firebird
 ```
 
-### macOS
+Results are saved to timestamped files: `benchmark_<driver>_<timestamp>.txt`
 
-Assuming you have Xcode (or Xcode Command Line Tools) and Homebrew installed:
-``` shell
-    brew install automake libtool openssl pkg-config
-    # For MySQL support
-    brew install mysql
-    # For PostgreSQL support
-    brew install postgresql
-    # openssl is not linked by Homebrew, this is to avoid "ld: library not found for -lssl"
-    export LDFLAGS=-L/usr/local/opt/openssl/lib 
+## Documentation
+
+| Document | Description |
+|---|---|
+| [FIREBIRD.md](FIREBIRD.md) | Driver specification and post-MVP roadmap |
+| [BENCHMARK_RESULTS.md](BENCHMARK_RESULTS.md) | Three-way comparison: MariaDB vs PostgreSQL vs Firebird |
+| [BENCHMARK_FIREBIRD_VERSIONS.md](BENCHMARK_FIREBIRD_VERSIONS.md) | Cross-version comparison: Firebird 3 vs 4 vs 5 |
+| [docs/IMPLEMENTATION.md](docs/IMPLEMENTATION.md) | What was changed in sysbench, architecture decisions |
+| [docs/DEV_ENVIRONMENT.md](docs/DEV_ENVIRONMENT.md) | Development machine setup (WSL2, Debian, tools) |
+| [docs/BUILDING_FIREBIRD.md](docs/BUILDING_FIREBIRD.md) | Compiling Firebird 3, 4, and 5 from source |
+
+## Tests
+
+The Firebird driver includes 11 test files using the
+[Cram](https://bitheap.org/cram/) framework, matching the coverage of the
+MySQL and PostgreSQL drivers:
+
+```bash
+export SBTEST_FIREBIRD_ARGS="--firebird-db=localhost:/tmp/sbtest.fdb --firebird-user=SYSDBA --firebird-password=masterkey"
+cd tests
+./test_run.sh t/drv_firebird.t
+./test_run.sh t/api_sql_firebird.t
+./test_run.sh t/script_oltp_read_write_firebird.t
+# ... etc
 ```
 
-## Build and Install
-``` shell
-    ./autogen.sh
-    # Add --with-pgsql to build with PostgreSQL support
-    ./configure
-    make -j
-    make install
+## Upstream Compatibility
+
+This fork maintains byte-identical Lua workload scripts with upstream sysbench.
+The only changes to upstream files are additive:
+
+- `configure.ac` — `--with-firebird` option (23 lines)
+- `src/db_driver.h` / `src/db_driver.c` — driver registration (7 lines)
+- `src/Makefile.am` / `src/drivers/Makefile.am` — build wiring (10 lines)
+- `src/db_driver.c` — single-row bulk insert support (10 lines)
+- `src/lua/oltp_common.lua` — Firebird DDL branch (7 lines)
+- `src/lua/oltp_insert.lua` — Firebird auto-inc support (1 line)
+
+SQL dialect differences (transactions, DDL syntax) are handled inside the
+driver, never in workload scripts. Verify with:
+
+```bash
+git diff upstream/master -- src/lua/
 ```
 
-The above will build sysbench with MySQL support by default. If you have
-MySQL headers and libraries in non-standard locations (and no
-`mysql_config` can be found in the `PATH`), you can specify them
-explicitly with `--with-mysql-includes` and `--with-mysql-libs` options
-to `./configure`.
+## License
 
-To compile sysbench without MySQL support, use `--without-mysql`. If no
-database drivers are available database-related scripts will not work,
-but other benchmarks will be functional.
+GPLv2, same as upstream sysbench.
 
-# Usage
+## Links
 
-## General Syntax
-
-The general command line syntax for sysbench is:
-
-		  sysbench [options]... [testname] [command] 
-
-- *testname* is an optional name of a built-in test (e.g. `fileio`,
-  `memory`, `cpu`, etc.), or a name of one of the bundled Lua scripts
-  (e.g. `oltp_read_only`), or a *path* to a custom Lua script. If no
-  test name is specified on the command line (and thus, there is no
-  *command* too, as in that case it would be parsed as a *testname*), or
-  the test name is a dash ("`-`"), then sysbench expects a Lua script to
-  execute on its standard input.
-
-- *command* is an optional argument that will be passed by sysbench to
-  the built-in test or script specified with *testname*. *command*
-  defines the *action* that must be performed by the test. The list of
-  available commands depends on a particular test. Some tests also
-  implement their own custom commands.
-
-  Below is a description of typical test commands and their purpose:
-
-	+ `prepare`: performs preparative actions for those tests which need
-	them, e.g. creating the necessary files on disk for the `fileio`
-	test, or filling the test database for database benchmarks.
-	+ `run`: runs the actual test specified with the *testname*
-    argument. This command is provided by all tests.
-	+ `cleanup`: removes temporary data after the test run in those
-    tests which create one.
-	+ `help`: displays usage information for the test specified with the
-	*testname* argument. This includes the full list of commands
-	provided by the test, so it should be used to get the available
-	commands.
-
-- *options* is a list of zero or more command line options starting with
-	`'--'`. As with commands, the `sysbench testname help` command
-	should be used to describe available options provided by a
-	particular test.
-
-	See [General command line options](README.md#general-command-line-options)
-	for a description of general options provided by sysbench itself.
-
-
-You can use `sysbench --help` to display the general command line syntax
-and options.
-
-## General Command Line Options
-
-The table below lists the supported common options, their descriptions and default values:
-
-*Option*              | *Description* | *Default value*
-----------------------|---------------|----------------
-| `--threads`           | The total number of worker threads to create                                                                                                                                                                                                                                                                                                                                                                                                                            | 1               |
-| `--events`            | Limit for total number of requests. 0 (the default) means no limit                                                                                                                                                                                                                                                                                                                                                                                                      | 0               |
-| `--time`              | Limit for total execution time in seconds. 0 means no limit                                                                                                                                                                                                                                                                                                                                                                                                             | 10              |
-| `--warmup-time`       | Execute events for this many seconds with statistics disabled before the actual benchmark run with statistics enabled. This is useful when you want to exclude the initial period of a benchmark run from statistics. In many benchmarks, the initial period is not representative because CPU/database/page and other caches need some time to warm up                                                                                                                                                                                                                                                                                                  | 0               |
-| `--rate`              | Average transactions rate. The number specifies how many events (transactions) per seconds should be executed by all threads on average. 0 (default) means unlimited rate, i.e. events are executed as fast as possible                                                                                                                                                                                                                                                                 | 0               |
-| `--thread-init-timeout` | Wait time in seconds for worker threads to initialize                                                                                                                                                                                                                                                                                                                                                                                                                  | 30              |
-| `--thread-stack-size` | Size of stack for each thread                                                                                                                                                                                                                                                                                                                                                                                                                                           | 32K             |
-| `--report-interval`   | Periodically report intermediate statistics with a specified interval in seconds. Note that statistics produced by this option is per-interval rather than cumulative. 0 disables intermediate reports                                                                                                                                                                                                                                                                  | 0               |
-| `--debug`             | Print more debug info                                                                                                                                                                                                                                                                                                                                                                                                                                                   | off             |
-| `--validate`          | Perform validation of test results where possible                                                                                                                                                                                                                                                                                                                                                                                                                       | off             |
-| `--help`              | Print help on general syntax or on a specified test, and exit                                                                                                                                                                                                                                                                                                                                                                                                           | off             |
-| `--verbosity`         | Verbosity level (0 - only critical messages, 5 - debug)                                                                                                                                                                                                                                                                                                                                                                                                                 | 4               |
-| `--percentile`        | sysbench measures execution times for all processed requests to display statistical information like minimal, average and maximum execution time. For most benchmarks it is also useful to know a request execution time value matching some percentile (e.g. 95% percentile means we should drop 5% of the most long requests and choose the maximal value from the remaining ones). This option allows to specify a percentile rank of query execution times to count | 95              |
-| `--luajit-cmd`        | perform a LuaJIT control command. This option is equivalent to `luajit -j`. See [LuaJIT documentation](http://luajit.org/running.html#opt_j) for more information                                                                                                                                                                                                                                                                                                       |               |
-
-Note that numerical values for all *size* options (like `--thread-stack-size` in this table) may be specified by appending the corresponding multiplicative suffix (K for kilobytes, M for megabytes, G for gigabytes and T for terabytes).
-
-## Random Numbers Options
-
-sysbench provides a number of algorithms to generate random numbers that are distributed according to a given probability distribution. The table below lists options that can be used to control those algorithms.
-
-*Option*              | *Description* | *Default value*
-----------------------|---------------|----------------
-`--rand-type` | random numbers distribution {uniform, gaussian, special, pareto, zipfian} to use by default. Benchmark scripts may choose to use either the default distribution, or specify it explictly, i.e. override the default. | special
-`--rand-seed` | seed for random number generator. When 0, the current time is used as an RNG seed. | 0
-`--rand-spec-iter` | number of iterations for the special distribution | 12
-`--rand-spec-pct` | percentage of the entire range where 'special' values will fall in the special distribution | 1
-`--rand-spec-res` | percentage of 'special' values to use for the special distribution | 75
-`--rand-pareto-h` | shape parameter for the Pareto distribution | 0.2
-`--rand-zipfian-exp` | shape parameter (theta) for the Zipfian distribution | 0.8
-
-# Versioning
-
-For transparency and insight into its release cycle, and for striving to maintain backward compatibility, sysbench will be maintained under the Semantic Versioning guidelines as much as possible.
-
-Releases will be numbered with the following format:
-
-`<major>.<minor>.<patch>`
-
-And constructed with the following guidelines:
-
-* Breaking backward compatibility bumps the major (and resets the minor and patch)
-* New additions without breaking backward compatibility bumps the minor (and resets the patch)
-* Bug fixes and misc changes bumps the patch
-
-For more information on SemVer, please visit [http://semver.org/](http://semver.org/).
-
-[coveralls-badge]: https://coveralls.io/repos/github/akopytov/sysbench/badge.svg?branch=master
-[coveralls-url]: https://coveralls.io/github/akopytov/sysbench?branch=master
-[action-url]: https://github.com/akopytov/sysbench/actions/workflows/ci.yml
-[action-badge]: https://github.com/akopytov/sysbench/actions/workflows/ci.yml/badge.svg
-[license-badge]: https://img.shields.io/badge/license-GPLv2-blue.svg
-[license-url]: COPYING
-[release-badge]: https://img.shields.io/github/release/akopytov/sysbench.svg
-[release-url]: https://github.com/akopytov/sysbench/releases/latest
-[deb-badge]: https://img.shields.io/badge/Packages-Debian-red.svg?style=flat
-[deb-url]: https://packagecloud.io/akopytov/sysbench?filter=debs
-[rpm-badge]: https://img.shields.io/badge/Packages-RPM-blue.svg?style=flat
-[rpm-url]: https://packagecloud.io/akopytov/sysbench?filter=rpms
+- **This fork:** https://github.com/ZlatanOmerovic/firebird-sysbench
+- **Upstream sysbench:** https://github.com/akopytov/sysbench
+- **Firebird SQL:** https://firebirdsql.org

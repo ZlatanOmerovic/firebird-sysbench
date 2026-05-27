@@ -46,7 +46,7 @@ function event()
    local c_val = get_c_value()
    local pad_val = get_pad_value()
 
-   if (drv:name() == "pgsql" and sysbench.opt.auto_inc) then
+   if ((drv:name() == "pgsql" or drv:name() == "firebird") and sysbench.opt.auto_inc) then
       con:query(string.format("INSERT INTO %s (k, c, pad) VALUES " ..
                                  "(%d, '%s', '%s')",
                               table_name, k_val, c_val, pad_val))

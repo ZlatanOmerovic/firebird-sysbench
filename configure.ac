@@ -143,6 +143,17 @@ AS_IF([test "x$with_pgsql" != "xno"],
    [pgsql_support=no])
 AC_MSG_RESULT([$pgsql_support])
 
+# Check if we should compile with Firebird support
+AC_ARG_WITH([firebird],
+            AS_HELP_STRING([--with-firebird],
+                           [compile with Firebird support (default is disabled)]),
+            [], [with_firebird=no])
+AC_MSG_CHECKING([whether to compile with Firebird support])
+AS_IF([test "x$with_firebird" != "xno"],
+   [firebird_support=yes],
+   [firebird_support=no])
+AC_MSG_RESULT([$firebird_support])
+
 # Set LuaJIT flags
 SB_LUAJIT
 
@@ -199,6 +210,16 @@ AS_IF([test x$with_pgsql != xno], [
 ])
 AM_CONDITIONAL(USE_PGSQL, test x$with_pgsql != xno)
 AC_SUBST([USE_PGSQL])
+
+AS_IF([test x$with_firebird != xno], [
+    AC_CHECK_FIREBIRD([$with_firebird])
+    USE_FIREBIRD=1
+    AC_DEFINE(USE_FIREBIRD,1,[Define to 1 if you want to compile with Firebird support])
+    AC_SUBST([FIREBIRD_LIBS])
+    AC_SUBST([FIREBIRD_CFLAGS])
+])
+AM_CONDITIONAL(USE_FIREBIRD, test x$with_firebird != xno)
+AC_SUBST([USE_FIREBIRD])
 
 # Check for libaio
 AC_CHECK_AIO
@@ -400,6 +421,7 @@ src/Makefile
 src/drivers/Makefile
 src/drivers/mysql/Makefile
 src/drivers/pgsql/Makefile
+src/drivers/firebird/Makefile
 src/tests/Makefile
 src/tests/cpu/Makefile
 src/tests/fileio/Makefile
@@ -430,6 +452,7 @@ AC_MSG_RESULT([datadir            : $(eval echo ${datadir})])
 AC_MSG_RESULT([])
 AC_MSG_RESULT([MySQL support      : ${mysql_support}])
 AC_MSG_RESULT([PostgreSQL support : ${pgsql_support}])
+AC_MSG_RESULT([Firebird support   : ${firebird_support}])
 AC_MSG_RESULT([])
 AC_MSG_RESULT([LuaJIT             : ${sb_use_luajit}])
 AC_MSG_RESULT([LUAJIT_CFLAGS      : ${LUAJIT_CFLAGS}])
