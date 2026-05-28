@@ -238,6 +238,7 @@ typedef struct db_conn
   unsigned int    bulk_values;       /* Save value of bulk_ptr */
   unsigned int    bulk_commit_cnt;   /* Current value of uncommitted rows */
   unsigned int    bulk_commit_max;   /* Maximum value of uncommitted rows */
+  int             bulk_single_row;   /* 1 if driver doesn't support multi-row insert */
 
   char            pad[SB_CACHELINE_PAD(sizeof(db_error_t) +
                                        sizeof(int) +
@@ -250,7 +251,8 @@ typedef struct db_conn
                                        sizeof(int) +
                                        sizeof(int) * 2 +
                                        sizeof(void *) +
-                                       sizeof(int) * 4
+                                       sizeof(int) * 4 +
+                                       sizeof(int)
                                        )];
 } db_conn_t;
 
