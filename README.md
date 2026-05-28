@@ -4,10 +4,10 @@ Fork of [akopytov/sysbench](https://github.com/akopytov/sysbench) with native
 Firebird database support. Run the same industry-standard OLTP benchmarks used
 for MySQL and PostgreSQL against Firebird 3, 4, and 5.
 
-> **Note:** This branch (`firebird-isc`) uses the legacy ISC API (`ibase.h`),
-> which works across Firebird 2.5 through 5.x. The `master` branch will contain
-> the OO API driver (Firebird 3+ only) with Batch API support and lower
-> per-query overhead. The ISC driver is maintained for backward compatibility.
+The driver uses the **Firebird OO API** (`fb_c_api.h`) — the native interface
+in Firebird 3+. On Firebird 4+, the **Batch API** is used for bulk inserts,
+delivering 50x faster data loading than single-row INSERTs. The legacy ISC API
+version is preserved on the `firebird-isc` branch.
 
 ## Quick Start
 
@@ -72,28 +72,20 @@ All standard sysbench OLTP benchmarks work with Firebird:
 
 ## Supported Firebird Versions
 
-The driver uses the legacy ISC API (`ibase.h`) which is stable across all
-modern Firebird versions. Tested and verified against:
-
-- **Firebird 5.0.4** — full support, all tests pass
-- **Firebird 4.0.7** — full support, all tests pass
-- **Firebird 3.0.14** — full support, all benchmarks pass
+| Version | Support | Batch API |
+|---|---|---|
+| **Firebird 5.0** | Full | Yes (313K TPS bulk insert) |
+| **Firebird 4.0** | Full | Yes (321K TPS bulk insert) |
+| **Firebird 3.0** | Full | No (falls back to single-row, 6K TPS) |
 
 ## Building with Multiple Drivers
-
-sysbench can be built with MySQL, PostgreSQL, and Firebird simultaneously:
 
 ```bash
 ./configure --with-mysql --with-pgsql --with-firebird=/opt/firebird
 make -j$(nproc)
 ```
 
-This produces a single binary that supports all three databases, enabling
-direct A/B/C comparisons on identical hardware.
-
 ## Benchmark Scripts
-
-Two helper scripts are included for running complete benchmark suites:
 
 ```bash
 # Full suite (10 benchmarks, cleanup+prepare before each)
@@ -111,52 +103,35 @@ FIREBIRD_DB=localhost/3054:/tmp/sbtest.fdb ./run_benchmarks.sh firebird
 THREADS=8 TIME=30 TABLE_SIZE=100000 ./run_benchmarks.sh firebird
 ```
 
-Results are saved to timestamped files: `benchmark_<driver>_<timestamp>.txt`
-
 ## Documentation
 
 | Document | Description |
 |---|---|
-| [FIREBIRD.md](FIREBIRD.md) | Driver specification and post-MVP roadmap |
-| [BENCHMARK_RESULTS.md](BENCHMARK_RESULTS.md) | Three-way comparison: MariaDB vs PostgreSQL vs Firebird |
-| [BENCHMARK_FIREBIRD_VERSIONS.md](BENCHMARK_FIREBIRD_VERSIONS.md) | Cross-version comparison: Firebird 3 vs 4 vs 5 |
-| [docs/IMPLEMENTATION.md](docs/IMPLEMENTATION.md) | What was changed in sysbench, architecture decisions |
-| [docs/DEV_ENVIRONMENT.md](docs/DEV_ENVIRONMENT.md) | Development machine setup (WSL2, Debian, tools) |
-| [docs/BUILDING_FIREBIRD.md](docs/BUILDING_FIREBIRD.md) | Compiling Firebird 3, 4, and 5 from source |
+| [FIREBIRD.md](FIREBIRD.md) | Driver specification and roadmap |
+| [BENCHMARK_RESULTS.md](BENCHMARK_RESULTS.md) | Three-way: MariaDB vs PostgreSQL vs Firebird |
+| [BENCHMARK_FIREBIRD_VERSIONS.md](BENCHMARK_FIREBIRD_VERSIONS.md) | Cross-version: Firebird 3 vs 4 vs 5 |
+| [docs/IMPLEMENTATION.md](docs/IMPLEMENTATION.md) | Implementation details |
+| [docs/DEV_ENVIRONMENT.md](docs/DEV_ENVIRONMENT.md) | Development machine setup |
+| [docs/BUILDING_FIREBIRD.md](docs/BUILDING_FIREBIRD.md) | Compiling Firebird from source |
 
 ## Tests
 
-The Firebird driver includes 11 test files using the
-[Cram](https://bitheap.org/cram/) framework, matching the coverage of the
-MySQL and PostgreSQL drivers:
+11 Cram test files matching MySQL/PostgreSQL coverage:
 
 ```bash
 export SBTEST_FIREBIRD_ARGS="--firebird-db=localhost:/tmp/sbtest.fdb --firebird-user=SYSDBA --firebird-password=masterkey"
-cd tests
-./test_run.sh t/drv_firebird.t
-./test_run.sh t/api_sql_firebird.t
-./test_run.sh t/script_oltp_read_write_firebird.t
-# ... etc
+cd tests && ./test_run.sh t/drv_firebird.t
 ```
 
 ## Upstream Compatibility
 
-This fork maintains byte-identical Lua workload scripts with upstream sysbench.
-The only changes to upstream files are additive:
+Lua workload scripts stay byte-identical to upstream. Only additive changes:
 
-- `configure.ac` — `--with-firebird` option (23 lines)
-- `src/db_driver.h` / `src/db_driver.c` — driver registration (7 lines)
-- `src/Makefile.am` / `src/drivers/Makefile.am` — build wiring (10 lines)
-- `src/db_driver.c` — single-row bulk insert support (10 lines)
-- `src/lua/oltp_common.lua` — Firebird DDL branch (7 lines)
-- `src/lua/oltp_insert.lua` — Firebird auto-inc support (1 line)
-
-SQL dialect differences (transactions, DDL syntax) are handled inside the
-driver, never in workload scripts. Verify with:
-
-```bash
-git diff upstream/master -- src/lua/
-```
+- `configure.ac` — `--with-firebird` option
+- `src/db_driver.h` / `src/db_driver.c` — driver registration + bulk insert fix
+- `src/Makefile.am` / `src/drivers/Makefile.am` — build wiring
+- `src/lua/oltp_common.lua` — Firebird DDL branch
+- `src/lua/oltp_insert.lua` — Firebird auto-inc support
 
 ## License
 

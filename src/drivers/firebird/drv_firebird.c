@@ -30,18 +30,15 @@
 #include <stdio.h>
 #include <inttypes.h>
 
-#include <ibase.h>
+#include "firebird/fb_c_api.h"
 
 #include "sb_options.h"
 #include "db_driver.h"
 
 #define xfree(ptr) ({ if (ptr) free((void *)ptr); ptr = NULL; })
 
-#define MAX_PARAM_LENGTH 256UL
 #define MAX_COLUMN_LENGTH 512UL
-#define INITIAL_ROW_CAPACITY 64
-
-#define SQL_DIALECT_V6 3
+#define FB_DIALECT 3
 
 static sb_arg_t firebird_drv_args[] =
 {
@@ -60,36 +57,54 @@ typedef struct
   const char *password;
 } fb_drv_args_t;
 
+/* Per-process globals — initialized once in drv_init */
+static struct IMaster *fb_master;
+static struct IProvider *fb_prov;
+static struct IUtil *fb_utl;
+
+#define BATCH_FLUSH_SIZE 1000
+
 typedef struct
 {
-  isc_db_handle  db;
-  isc_tr_handle  trans;
+  struct IAttachment *att;
+  struct ITransaction *tra;
+  struct IStatus *st;
+  struct IBatch *batch;
+  struct IStatement *batch_stmt;
+  struct IMessageMetadata *batch_meta;
+  unsigned char *batch_buf;
+  unsigned batch_buf_len;
+  unsigned batch_count;
+  char *batch_base_sql;
+  int batch_auto_txn;
 } fb_conn_t;
 
 typedef struct
 {
-  isc_stmt_handle  stmt;
-  XSQLDA           *in_sqlda;
-  XSQLDA           *out_sqlda;
-  int              nparams;
-  char             prepared;
-  uint32_t         nfields;
-  char             cursor_open;
-  db_value_t       *cached_values;
-  char             **conv_bufs;
+  struct IStatement *stmt;
+  struct IMessageMetadata *in_meta;
+  struct IMessageMetadata *out_meta;
+  unsigned in_buf_len;
+  unsigned out_buf_len;
+  unsigned char *in_buf;
+  unsigned char *out_buf;
+  unsigned nparams;
+  unsigned nfields;
+  char prepared;
+  char cursor_open;
+  struct IResultSet *cursor;
+  db_value_t *cached_values;
+  char **conv_bufs;
 } fb_stmt_t;
 
 typedef struct
 {
-  isc_stmt_handle  stmt;
-  XSQLDA           *out_sqlda;
-  char             owns_stmt;
-  uint32_t         nrows;
-  uint32_t         nfields;
-  db_value_t       *values;
-  char             **strings;
-  uint32_t         nstrings;
-  uint32_t         strings_capacity;
+  unsigned nrows;
+  unsigned nfields;
+  db_value_t *values;
+  char **strings;
+  unsigned nstrings;
+  unsigned strings_capacity;
 } fb_result_t;
 
 static drv_caps_t firebird_drv_caps =
@@ -152,376 +167,32 @@ static db_driver_t firebird_driver =
 /* Helpers                                                            */
 /* ------------------------------------------------------------------ */
 
-static void fb_log_error(const char *func, ISC_STATUS_ARRAY status)
+static int fb_check_status(struct IStatus *st)
+{
+  return (IStatus_getState(st) & IStatus_STATE_ERRORS) != 0;
+}
+
+static void fb_log_error(const char *func, struct IStatus *st)
 {
   char msg[512];
-  const ISC_STATUS *p = status;
-
-  log_text(LOG_FATAL, "%s() failed:", func);
-  while (fb_interpret(msg, sizeof(msg), &p))
-    log_text(LOG_FATAL, "  %s", msg);
+  IUtil_formatStatus(fb_utl, msg, sizeof(msg), st);
+  log_text(LOG_FATAL, "%s() failed: %s", func, msg);
 }
 
-static int fb_ensure_transaction(fb_conn_t *fbc, ISC_STATUS_ARRAY status)
+static db_error_t fb_handle_error(db_conn_t *con, fb_conn_t *fbc,
+                                  const char *func, const char *query,
+                                  sb_counter_type_t *counter)
 {
-  if (fbc->trans != 0)
-    return 0;
-
-  if (isc_start_transaction(status, &fbc->trans, 1, &fbc->db, 0, NULL))
-  {
-    fb_log_error("isc_start_transaction", status);
-    return 1;
-  }
-
-  return 0;
-}
-
-static XSQLDA *fb_alloc_sqlda(int n)
-{
-  XSQLDA *sqlda = (XSQLDA *)malloc(XSQLDA_LENGTH(n));
-  if (sqlda == NULL)
-    return NULL;
-  memset(sqlda, 0, XSQLDA_LENGTH(n));
-  sqlda->sqln = n;
-  sqlda->version = SQLDA_VERSION1;
-  return sqlda;
-}
-
-static void fb_free_sqlda_buffers(XSQLDA *sqlda)
-{
-  if (sqlda == NULL)
-    return;
-
-  for (int i = 0; i < sqlda->sqld; i++)
-  {
-    XSQLVAR *var = &sqlda->sqlvar[i];
-    xfree(var->sqldata);
-    xfree(var->sqlind);
-  }
-}
-
-static int fb_allocate_output_buffers(XSQLDA *sqlda)
-{
-  for (int i = 0; i < sqlda->sqld; i++)
-  {
-    XSQLVAR *var = &sqlda->sqlvar[i];
-    short dtype = var->sqltype & ~1;
-
-    switch (dtype)
-    {
-    case SQL_VARYING:
-      var->sqldata = (char *)malloc(var->sqllen + 2);
-      break;
-    case SQL_TEXT:
-      var->sqldata = (char *)malloc(var->sqllen + 1);
-      break;
-    default:
-      var->sqldata = (char *)malloc(var->sqllen);
-      break;
-    }
-
-    if (var->sqldata == NULL)
-      return 1;
-
-    if (var->sqltype & 1)
-    {
-      var->sqlind = (short *)malloc(sizeof(short));
-      if (var->sqlind == NULL)
-        return 1;
-      *var->sqlind = 0;
-    }
-  }
-
-  return 0;
-}
-
-static void fb_extract_column_fast(XSQLVAR *var, db_value_t *val, char *conv_buf)
-{
-  if ((var->sqltype & 1) && var->sqlind && *var->sqlind == -1)
-  {
-    val->ptr = NULL;
-    val->len = 0;
-    return;
-  }
-
-  short dtype = var->sqltype & ~1;
-
-  switch (dtype)
-  {
-  case SQL_TEXT:
-  {
-    int len = var->sqllen;
-    while (len > 0 && var->sqldata[len - 1] == ' ')
-      len--;
-    val->ptr = var->sqldata;
-    val->len = (uint32_t)len;
-    return;
-  }
-  case SQL_VARYING:
-  {
-    ISC_USHORT vary_len;
-    memcpy(&vary_len, var->sqldata, sizeof(ISC_USHORT));
-    val->ptr = var->sqldata + sizeof(ISC_USHORT);
-    val->len = vary_len;
-    return;
-  }
-  case SQL_SHORT:
-  {
-    short v;
-    memcpy(&v, var->sqldata, sizeof(short));
-    val->len = (uint32_t)snprintf(conv_buf, MAX_COLUMN_LENGTH, "%d", (int)v);
-    val->ptr = conv_buf;
-    return;
-  }
-  case SQL_LONG:
-  {
-    ISC_LONG v;
-    memcpy(&v, var->sqldata, sizeof(ISC_LONG));
-    val->len = (uint32_t)snprintf(conv_buf, MAX_COLUMN_LENGTH, "%d", (int)v);
-    val->ptr = conv_buf;
-    return;
-  }
-  case SQL_INT64:
-  {
-    ISC_INT64 v;
-    memcpy(&v, var->sqldata, sizeof(ISC_INT64));
-    val->len = (uint32_t)snprintf(conv_buf, MAX_COLUMN_LENGTH, "%" PRId64, (int64_t)v);
-    val->ptr = conv_buf;
-    return;
-  }
-  case SQL_FLOAT:
-  {
-    float v;
-    memcpy(&v, var->sqldata, sizeof(float));
-    val->len = (uint32_t)snprintf(conv_buf, MAX_COLUMN_LENGTH, "%g", (double)v);
-    val->ptr = conv_buf;
-    return;
-  }
-  case SQL_DOUBLE:
-  {
-    double v;
-    memcpy(&v, var->sqldata, sizeof(double));
-    val->len = (uint32_t)snprintf(conv_buf, MAX_COLUMN_LENGTH, "%g", v);
-    val->ptr = conv_buf;
-    return;
-  }
-  default:
-    val->len = (uint32_t)snprintf(conv_buf, MAX_COLUMN_LENGTH, "?");
-    val->ptr = conv_buf;
-    return;
-  }
-}
-
-static char *fb_extract_column(XSQLVAR *var, uint32_t *out_len)
-{
-  if ((var->sqltype & 1) && var->sqlind && *var->sqlind == -1)
-  {
-    *out_len = 0;
-    return NULL;
-  }
-
-  char buf[MAX_COLUMN_LENGTH];
-  int n;
-  short dtype = var->sqltype & ~1;
-
-  switch (dtype)
-  {
-  case SQL_TEXT:
-  {
-    int len = var->sqllen;
-    while (len > 0 && var->sqldata[len - 1] == ' ')
-      len--;
-    *out_len = (uint32_t)len;
-    char *s = malloc(len + 1);
-    if (s == NULL)
-      return NULL;
-    memcpy(s, var->sqldata, len);
-    s[len] = '\0';
-    return s;
-  }
-  case SQL_VARYING:
-  {
-    ISC_USHORT vary_len;
-    memcpy(&vary_len, var->sqldata, sizeof(ISC_USHORT));
-    *out_len = vary_len;
-    char *s = malloc(vary_len + 1);
-    if (s == NULL)
-      return NULL;
-    memcpy(s, var->sqldata + sizeof(ISC_USHORT), vary_len);
-    s[vary_len] = '\0';
-    return s;
-  }
-  case SQL_SHORT:
-  {
-    short val;
-    memcpy(&val, var->sqldata, sizeof(short));
-    n = snprintf(buf, sizeof(buf), "%d", (int)val);
-    break;
-  }
-  case SQL_LONG:
-  {
-    ISC_LONG val;
-    memcpy(&val, var->sqldata, sizeof(ISC_LONG));
-    n = snprintf(buf, sizeof(buf), "%d", (int)val);
-    break;
-  }
-  case SQL_INT64:
-  {
-    ISC_INT64 val;
-    memcpy(&val, var->sqldata, sizeof(ISC_INT64));
-    n = snprintf(buf, sizeof(buf), "%" PRId64, (int64_t)val);
-    break;
-  }
-  case SQL_FLOAT:
-  {
-    float val;
-    memcpy(&val, var->sqldata, sizeof(float));
-    n = snprintf(buf, sizeof(buf), "%g", (double)val);
-    break;
-  }
-  case SQL_DOUBLE:
-  {
-    double val;
-    memcpy(&val, var->sqldata, sizeof(double));
-    n = snprintf(buf, sizeof(buf), "%g", val);
-    break;
-  }
-  default:
-    n = snprintf(buf, sizeof(buf), "?");
-    break;
-  }
-
-  if (n < 0)
-    n = 0;
-
-  *out_len = (uint32_t)n;
-  char *s = malloc(n + 1);
-  if (s == NULL)
-    return NULL;
-  memcpy(s, buf, n);
-  s[n] = '\0';
-  return s;
-}
-
-static void fb_result_add_string(fb_result_t *fbrs, char *s)
-{
-  if (s == NULL)
-    return;
-
-  if (fbrs->nstrings >= fbrs->strings_capacity)
-  {
-    uint32_t new_cap = fbrs->strings_capacity ? fbrs->strings_capacity * 2 : 64;
-    char **new_arr = realloc(fbrs->strings, new_cap * sizeof(char *));
-    if (new_arr == NULL)
-    {
-      free(s);
-      return;
-    }
-    fbrs->strings = new_arr;
-    fbrs->strings_capacity = new_cap;
-  }
-
-  fbrs->strings[fbrs->nstrings++] = s;
-}
-
-static fb_result_t *fb_fetch_all_rows(XSQLDA *out_sqlda,
-                                      isc_stmt_handle *stmt_handle,
-                                      ISC_STATUS_ARRAY status,
-                                      uint32_t *total_rows)
-{
-  uint32_t nfields = (uint32_t)out_sqlda->sqld;
-  uint32_t capacity = INITIAL_ROW_CAPACITY;
-  uint32_t nrows = 0;
-
-  fb_result_t *fbrs = (fb_result_t *)calloc(1, sizeof(fb_result_t));
-  if (fbrs == NULL)
-    return NULL;
-
-  fbrs->nfields = nfields;
-  fbrs->values = (db_value_t *)calloc(capacity * nfields, sizeof(db_value_t));
-  if (fbrs->values == NULL)
-  {
-    free(fbrs);
-    return NULL;
-  }
-
-  ISC_STATUS fetch_stat;
-  while ((fetch_stat = isc_dsql_fetch(status, stmt_handle, SQL_DIALECT_V6,
-                                       out_sqlda)) == 0)
-  {
-    if (nrows >= capacity)
-    {
-      capacity *= 2;
-      db_value_t *new_vals = realloc(fbrs->values,
-                                     capacity * nfields * sizeof(db_value_t));
-      if (new_vals == NULL)
-        break;
-      fbrs->values = new_vals;
-    }
-
-    for (uint32_t i = 0; i < nfields; i++)
-    {
-      uint32_t col_len = 0;
-      char *s = fb_extract_column(&out_sqlda->sqlvar[i], &col_len);
-
-      db_value_t *v = &fbrs->values[nrows * nfields + i];
-      v->ptr = s;
-      v->len = col_len;
-
-      fb_result_add_string(fbrs, s);
-    }
-    nrows++;
-  }
-
-  fbrs->nrows = nrows;
-  *total_rows = nrows;
-
-  if (fetch_stat != 100 && fetch_stat != 0)
-    return fbrs;
-
-  return fbrs;
-}
-
-static void fb_free_result(fb_result_t *fbrs)
-{
-  ISC_STATUS_ARRAY status;
-
-  if (fbrs == NULL)
-    return;
-
-  for (uint32_t i = 0; i < fbrs->nstrings; i++)
-    free(fbrs->strings[i]);
-  free(fbrs->strings);
-  free(fbrs->values);
-
-  if (fbrs->out_sqlda != NULL)
-  {
-    fb_free_sqlda_buffers(fbrs->out_sqlda);
-    free(fbrs->out_sqlda);
-  }
-  if (fbrs->owns_stmt && fbrs->stmt != 0)
-    isc_dsql_free_statement(status, &fbrs->stmt, DSQL_drop);
-
-  free(fbrs);
-}
-
-static db_error_t fb_check_error(db_conn_t *con, ISC_STATUS_ARRAY status,
-                                 const char *func, const char *query,
-                                 sb_counter_type_t *counter)
-{
-  long sqlcode = isc_sqlcode(status);
-
   char msg[512];
-  const ISC_STATUS *p = status;
-  msg[0] = '\0';
-  fb_interpret(msg, sizeof(msg), &p);
+  IUtil_formatStatus(fb_utl, msg, sizeof(msg), fbc->st);
+
+  long sqlcode = isc_sqlcode(IStatus_getErrors(fbc->st));
 
   char sqlstate_buf[16];
   snprintf(sqlstate_buf, sizeof(sqlstate_buf), "%05ld",
            sqlcode < 0 ? -sqlcode : sqlcode);
 
   con->sql_errno = (int)sqlcode;
-
   xfree(con->sql_state);
   xfree(con->sql_errmsg);
   con->sql_state = strdup(sqlstate_buf);
@@ -529,12 +200,12 @@ static db_error_t fb_check_error(db_conn_t *con, ISC_STATUS_ARRAY status,
 
   if (sqlcode == -913 || sqlcode == -803)
   {
-    fb_conn_t *fbc = (fb_conn_t *)con->ptr;
-    if (fbc->trans != 0)
+    if (fbc->tra != NULL)
     {
-      ISC_STATUS_ARRAY rb_status;
-      isc_rollback_transaction(rb_status, &fbc->trans);
-      fbc->trans = 0;
+      struct IStatus *rst = IMaster_getStatus(fb_master);
+      ITransaction_rollback(fbc->tra, rst);
+      IStatus_dispose(rst);
+      fbc->tra = NULL;
     }
     *counter = SB_CNT_ERROR;
     return DB_ERROR_IGNORABLE;
@@ -546,6 +217,467 @@ static db_error_t fb_check_error(db_conn_t *con, ISC_STATUS_ARRAY status,
 
   *counter = SB_CNT_ERROR;
   return DB_ERROR_FATAL;
+}
+
+static int fb_ensure_transaction(fb_conn_t *fbc)
+{
+  if (fbc->tra != NULL)
+    return 0;
+
+  IStatus_init(fbc->st);
+  fbc->tra = IAttachment_startTransaction(fbc->att, fbc->st, 0, NULL);
+  if (fb_check_status(fbc->st))
+  {
+    fb_log_error("startTransaction", fbc->st);
+    fbc->tra = NULL;
+    return 1;
+  }
+
+  return 0;
+}
+
+static void fb_extract_column_fast(struct IMessageMetadata *meta,
+                                   struct IStatus *st,
+                                   unsigned char *buf,
+                                   unsigned idx,
+                                   db_value_t *val,
+                                   char *conv_buf)
+{
+  unsigned nullOff = IMessageMetadata_getNullOffset(meta, st, idx);
+  if (*(short *)(buf + nullOff) != 0)
+  {
+    val->ptr = NULL;
+    val->len = 0;
+    return;
+  }
+
+  unsigned off = IMessageMetadata_getOffset(meta, st, idx);
+  unsigned type = IMessageMetadata_getType(meta, st, idx) & ~1;
+  unsigned len = IMessageMetadata_getLength(meta, st, idx);
+
+  switch (type)
+  {
+  case SQL_TEXT:
+  {
+    char *data = (char *)(buf + off);
+    while (len > 0 && data[len - 1] == ' ')
+      len--;
+    val->ptr = data;
+    val->len = len;
+    return;
+  }
+  case SQL_VARYING:
+  {
+    ISC_USHORT vary_len;
+    memcpy(&vary_len, buf + off, sizeof(ISC_USHORT));
+    val->ptr = (const char *)(buf + off + sizeof(ISC_USHORT));
+    val->len = vary_len;
+    return;
+  }
+  case SQL_SHORT:
+  {
+    short v;
+    memcpy(&v, buf + off, sizeof(short));
+    val->len = (uint32_t)snprintf(conv_buf, MAX_COLUMN_LENGTH, "%d", (int)v);
+    val->ptr = conv_buf;
+    return;
+  }
+  case SQL_LONG:
+  {
+    ISC_LONG v;
+    memcpy(&v, buf + off, sizeof(ISC_LONG));
+    val->len = (uint32_t)snprintf(conv_buf, MAX_COLUMN_LENGTH, "%d", (int)v);
+    val->ptr = conv_buf;
+    return;
+  }
+  case SQL_INT64:
+  {
+    ISC_INT64 v;
+    memcpy(&v, buf + off, sizeof(ISC_INT64));
+    val->len = (uint32_t)snprintf(conv_buf, MAX_COLUMN_LENGTH, "%" PRId64,
+                                  (int64_t)v);
+    val->ptr = conv_buf;
+    return;
+  }
+  case SQL_FLOAT:
+  {
+    float v;
+    memcpy(&v, buf + off, sizeof(float));
+    val->len = (uint32_t)snprintf(conv_buf, MAX_COLUMN_LENGTH, "%g", (double)v);
+    val->ptr = conv_buf;
+    return;
+  }
+  case SQL_DOUBLE:
+  {
+    double v;
+    memcpy(&v, buf + off, sizeof(double));
+    val->len = (uint32_t)snprintf(conv_buf, MAX_COLUMN_LENGTH, "%g", v);
+    val->ptr = conv_buf;
+    return;
+  }
+  default:
+    val->len = (uint32_t)snprintf(conv_buf, MAX_COLUMN_LENGTH, "?");
+    val->ptr = conv_buf;
+    return;
+  }
+}
+
+static void fb_result_add_string(fb_result_t *fbrs, char *s)
+{
+  if (s == NULL)
+    return;
+  if (fbrs->nstrings >= fbrs->strings_capacity)
+  {
+    unsigned new_cap = fbrs->strings_capacity ? fbrs->strings_capacity * 2 : 64;
+    char **new_arr = realloc(fbrs->strings, new_cap * sizeof(char *));
+    if (new_arr == NULL) { free(s); return; }
+    fbrs->strings = new_arr;
+    fbrs->strings_capacity = new_cap;
+  }
+  fbrs->strings[fbrs->nstrings++] = s;
+}
+
+static char *fb_extract_column_alloc(struct IMessageMetadata *meta,
+                                     struct IStatus *st,
+                                     unsigned char *buf,
+                                     unsigned idx,
+                                     uint32_t *out_len)
+{
+  unsigned nullOff = IMessageMetadata_getNullOffset(meta, st, idx);
+  if (*(short *)(buf + nullOff) != 0)
+  {
+    *out_len = 0;
+    return NULL;
+  }
+
+  unsigned off = IMessageMetadata_getOffset(meta, st, idx);
+  unsigned type = IMessageMetadata_getType(meta, st, idx) & ~1;
+  unsigned len = IMessageMetadata_getLength(meta, st, idx);
+  char tmp[MAX_COLUMN_LENGTH];
+  int n;
+
+  switch (type)
+  {
+  case SQL_TEXT:
+  {
+    char *data = (char *)(buf + off);
+    while (len > 0 && data[len - 1] == ' ')
+      len--;
+    *out_len = len;
+    char *s = malloc(len + 1);
+    if (s) { memcpy(s, data, len); s[len] = '\0'; }
+    return s;
+  }
+  case SQL_VARYING:
+  {
+    ISC_USHORT vary_len;
+    memcpy(&vary_len, buf + off, sizeof(ISC_USHORT));
+    *out_len = vary_len;
+    char *s = malloc(vary_len + 1);
+    if (s) { memcpy(s, buf + off + sizeof(ISC_USHORT), vary_len); s[vary_len] = '\0'; }
+    return s;
+  }
+  case SQL_SHORT:
+  {
+    short v; memcpy(&v, buf + off, sizeof(short));
+    n = snprintf(tmp, sizeof(tmp), "%d", (int)v);
+    break;
+  }
+  case SQL_LONG:
+  {
+    ISC_LONG v; memcpy(&v, buf + off, sizeof(ISC_LONG));
+    n = snprintf(tmp, sizeof(tmp), "%d", (int)v);
+    break;
+  }
+  case SQL_INT64:
+  {
+    ISC_INT64 v; memcpy(&v, buf + off, sizeof(ISC_INT64));
+    n = snprintf(tmp, sizeof(tmp), "%" PRId64, (int64_t)v);
+    break;
+  }
+  case SQL_FLOAT:
+  {
+    float v; memcpy(&v, buf + off, sizeof(float));
+    n = snprintf(tmp, sizeof(tmp), "%g", (double)v);
+    break;
+  }
+  case SQL_DOUBLE:
+  {
+    double v; memcpy(&v, buf + off, sizeof(double));
+    n = snprintf(tmp, sizeof(tmp), "%g", v);
+    break;
+  }
+  default:
+    n = snprintf(tmp, sizeof(tmp), "?");
+    break;
+  }
+
+  if (n < 0) n = 0;
+  *out_len = (uint32_t)n;
+  char *s = malloc(n + 1);
+  if (s) { memcpy(s, tmp, n); s[n] = '\0'; }
+  return s;
+}
+
+static void fb_free_result(fb_result_t *fbrs)
+{
+  if (fbrs == NULL)
+    return;
+  for (unsigned i = 0; i < fbrs->nstrings; i++)
+    free(fbrs->strings[i]);
+  free(fbrs->strings);
+  free(fbrs->values);
+  free(fbrs);
+}
+
+
+/* ------------------------------------------------------------------ */
+/* Batch insert helpers                                               */
+/* ------------------------------------------------------------------ */
+
+static int fb_batch_flush(fb_conn_t *fbc)
+{
+  if (fbc->batch == NULL || fbc->batch_count == 0)
+    return 0;
+
+  IStatus_init(fbc->st);
+  struct IBatchCompletionState *cs = IBatch_execute(fbc->batch, fbc->st,
+                                                     fbc->tra);
+  if (cs)
+    IBatchCompletionState_dispose(cs);
+
+  if (fb_check_status(fbc->st))
+  {
+    fb_log_error("IBatch_execute", fbc->st);
+    return 1;
+  }
+
+  fbc->batch_count = 0;
+
+  if (fbc->batch_auto_txn && fbc->tra != NULL)
+  {
+    IStatus_init(fbc->st);
+    ITransaction_commitRetaining(fbc->tra, fbc->st);
+  }
+
+  return 0;
+}
+
+static void fb_batch_close(fb_conn_t *fbc)
+{
+  if (fbc->batch != NULL)
+  {
+    if (fbc->batch_count > 0)
+      fb_batch_flush(fbc);
+    IStatus_init(fbc->st);
+    IBatch_close(fbc->batch, fbc->st);
+    fbc->batch = NULL;
+  }
+  if (fbc->batch_stmt != NULL)
+  {
+    IStatement_free(fbc->batch_stmt, fbc->st);
+    fbc->batch_stmt = NULL;
+  }
+  if (fbc->batch_meta != NULL)
+  {
+    IMessageMetadata_release(fbc->batch_meta);
+    fbc->batch_meta = NULL;
+  }
+  free(fbc->batch_buf);
+  fbc->batch_buf = NULL;
+  fbc->batch_buf_len = 0;
+  fbc->batch_count = 0;
+  free(fbc->batch_base_sql);
+  fbc->batch_base_sql = NULL;
+}
+
+static int fb_batch_create(fb_conn_t *fbc, const char *base_sql,
+                            unsigned ncols)
+{
+  char param_sql[1024];
+  char params[256];
+  char *p = params;
+
+  if (ncols > 120)
+    return 1;
+
+  *p++ = '(';
+  for (unsigned i = 0; i < ncols; i++)
+  {
+    if (i > 0) *p++ = ',';
+    *p++ = '?';
+  }
+  *p++ = ')';
+  *p = '\0';
+
+  snprintf(param_sql, sizeof(param_sql), "%s%s", base_sql, params);
+
+  if (fb_ensure_transaction(fbc))
+    return 1;
+
+  IStatus_init(fbc->st);
+  struct IStatement *batch_stmt = IAttachment_prepare(fbc->att, fbc->st,
+      fbc->tra, 0, param_sql, FB_DIALECT, IStatement_PREPARE_PREFETCH_METADATA);
+
+  if (fb_check_status(fbc->st))
+  {
+    fb_log_error("prepare(batch)", fbc->st);
+    return 1;
+  }
+
+  struct IMessageMetadata *in_meta = IStatement_getInputMetadata(batch_stmt,
+                                                                  fbc->st);
+
+  IStatus_init(fbc->st);
+  fbc->batch = IStatement_createBatch(batch_stmt, fbc->st, in_meta, 0, NULL);
+
+  if (fb_check_status(fbc->st))
+  {
+    IMessageMetadata_release(in_meta);
+    IStatement_free(batch_stmt, fbc->st);
+    fbc->batch = NULL;
+    return -1;
+  }
+
+  fbc->batch_stmt = batch_stmt;
+
+  fbc->batch_meta = in_meta;
+  fbc->batch_buf_len = IMessageMetadata_getMessageLength(fbc->batch_meta,
+                                                          fbc->st);
+  fbc->batch_buf = (unsigned char *)calloc(1, fbc->batch_buf_len);
+  if (fbc->batch_buf == NULL)
+  {
+    fb_batch_close(fbc);
+    return 1;
+  }
+
+  fbc->batch_base_sql = strdup(base_sql);
+  fbc->batch_count = 0;
+
+  return 0;
+}
+
+static int fb_batch_add_row(fb_conn_t *fbc, const char *values_str)
+{
+  memset(fbc->batch_buf, 0, fbc->batch_buf_len);
+
+  unsigned ncols = IMessageMetadata_getCount(fbc->batch_meta, fbc->st);
+  const char *p = values_str;
+
+  while (*p && *p != '(') p++;
+  if (*p == '(') p++;
+
+  for (unsigned col = 0; col < ncols; col++)
+  {
+    while (*p == ' ') p++;
+
+    unsigned off = IMessageMetadata_getOffset(fbc->batch_meta, fbc->st, col);
+    unsigned nullOff = IMessageMetadata_getNullOffset(fbc->batch_meta, fbc->st, col);
+    unsigned type = IMessageMetadata_getType(fbc->batch_meta, fbc->st, col) & ~1;
+    unsigned meta_len = IMessageMetadata_getLength(fbc->batch_meta, fbc->st, col);
+
+    *(short *)(fbc->batch_buf + nullOff) = 0;
+
+    if (*p == '\'')
+    {
+      p++;
+      char tmp[4096];
+      unsigned slen = 0;
+      while (*p)
+      {
+        if (*p == '\'')
+        {
+          if (*(p + 1) == '\'')
+          {
+            if (slen < sizeof(tmp)) tmp[slen++] = '\'';
+            p += 2;
+            continue;
+          }
+          break;
+        }
+        if (slen < sizeof(tmp)) tmp[slen++] = *p;
+        p++;
+      }
+      if (*p == '\'') p++;
+
+      if (type == SQL_TEXT)
+      {
+        unsigned copy = slen < meta_len ? slen : meta_len;
+        memcpy(fbc->batch_buf + off, tmp, copy);
+        if (copy < meta_len)
+          memset(fbc->batch_buf + off + copy, ' ', meta_len - copy);
+      }
+      else
+      {
+        if (slen > meta_len) slen = meta_len;
+        ISC_USHORT vary_len = (ISC_USHORT)slen;
+        memcpy(fbc->batch_buf + off, &vary_len, sizeof(ISC_USHORT));
+        memcpy(fbc->batch_buf + off + sizeof(ISC_USHORT), tmp, slen);
+      }
+    }
+    else if (strncasecmp(p, "NULL", 4) == 0 &&
+             (p[4] == ',' || p[4] == ')' || p[4] == ' ' || p[4] == '\0'))
+    {
+      *(short *)(fbc->batch_buf + nullOff) = -1;
+      while (*p && *p != ',' && *p != ')') p++;
+    }
+    else
+    {
+      const char *start = p;
+      while (*p && *p != ',' && *p != ')') p++;
+      unsigned slen = (unsigned)(p - start);
+      while (slen > 0 && start[slen - 1] == ' ') slen--;
+
+      if (type == SQL_LONG)
+      {
+        ISC_LONG val = (ISC_LONG)atoi(start);
+        memcpy(fbc->batch_buf + off, &val, sizeof(ISC_LONG));
+      }
+      else if (type == SQL_INT64)
+      {
+        ISC_INT64 val = (ISC_INT64)atoll(start);
+        memcpy(fbc->batch_buf + off, &val, sizeof(ISC_INT64));
+      }
+      else if (type == SQL_SHORT)
+      {
+        short val = (short)atoi(start);
+        memcpy(fbc->batch_buf + off, &val, sizeof(short));
+      }
+      else if (type == SQL_FLOAT)
+      {
+        float val = (float)atof(start);
+        memcpy(fbc->batch_buf + off, &val, sizeof(float));
+      }
+      else if (type == SQL_DOUBLE)
+      {
+        double val = atof(start);
+        memcpy(fbc->batch_buf + off, &val, sizeof(double));
+      }
+      else
+      {
+        ISC_LONG val = (ISC_LONG)atoi(start);
+        memcpy(fbc->batch_buf + off, &val, sizeof(ISC_LONG));
+      }
+    }
+
+    while (*p == ' ' || *p == ',') p++;
+  }
+
+  IStatus_init(fbc->st);
+  IBatch_add(fbc->batch, fbc->st, 1, fbc->batch_buf);
+
+  if (fb_check_status(fbc->st))
+  {
+    fb_log_error("IBatch_add", fbc->st);
+    return 1;
+  }
+
+  fbc->batch_count++;
+
+  if (fbc->batch_count >= BATCH_FLUSH_SIZE)
+    return fb_batch_flush(fbc);
+
+  return 0;
 }
 
 
@@ -566,6 +698,10 @@ int firebird_drv_init(void)
   args.user = sb_get_value_string("firebird-user");
   args.password = sb_get_value_string("firebird-password");
 
+  fb_master = fb_get_master_interface();
+  fb_prov = IMaster_getDispatcher(fb_master);
+  fb_utl = IMaster_getUtilInterface(fb_master);
+
   use_ps = 0;
   firebird_drv_caps.prepared_statements = 1;
   if (db_globals.ps_mode != DB_PS_MODE_DISABLE)
@@ -584,56 +720,53 @@ int firebird_drv_describe(drv_caps_t *caps)
 
 int firebird_drv_connect(db_conn_t *sb_conn)
 {
-  ISC_STATUS_ARRAY status;
-  fb_conn_t *fbc;
-  char dpb[256];
-  char *p;
-  size_t len;
-
-  fbc = (fb_conn_t *)calloc(1, sizeof(fb_conn_t));
+  fb_conn_t *fbc = (fb_conn_t *)calloc(1, sizeof(fb_conn_t));
   if (fbc == NULL)
     return 1;
 
-  p = dpb;
-  *p++ = isc_dpb_version1;
+  fbc->st = IMaster_getStatus(fb_master);
+  IStatus_init(fbc->st);
 
-  *p++ = isc_dpb_user_name;
-  len = strlen(args.user);
-  *p++ = (char)len;
-  memcpy(p, args.user, len);
-  p += len;
+  struct IXpbBuilder *dpb = IUtil_getXpbBuilder(fb_utl, fbc->st,
+                                                 IXpbBuilder_DPB, NULL, 0);
+  if (fb_check_status(fbc->st))
+    goto error;
 
-  *p++ = isc_dpb_password;
-  len = strlen(args.password);
-  *p++ = (char)len;
-  memcpy(p, args.password, len);
-  p += len;
+  IXpbBuilder_insertString(dpb, fbc->st, isc_dpb_user_name, args.user);
+  IXpbBuilder_insertString(dpb, fbc->st, isc_dpb_password, args.password);
+  IXpbBuilder_insertString(dpb, fbc->st, isc_dpb_lc_ctype, "UTF8");
 
-  *p++ = isc_dpb_lc_ctype;
-  len = 4;
-  *p++ = (char)len;
-  memcpy(p, "UTF8", len);
-  p += len;
-
-  short dpb_len = (short)(p - dpb);
-
-  if (isc_attach_database(status, 0, args.db, &fbc->db, dpb_len, dpb))
+  if (fb_check_status(fbc->st))
   {
-    fb_log_error("isc_attach_database", status);
-    free(fbc);
-    return 1;
+    IXpbBuilder_dispose(dpb);
+    goto error;
   }
 
-  fbc->trans = 0;
-  sb_conn->ptr = fbc;
+  fbc->att = IProvider_attachDatabase(fb_prov, fbc->st, args.db,
+      IXpbBuilder_getBufferLength(dpb, fbc->st),
+      IXpbBuilder_getBuffer(dpb, fbc->st));
 
+  IXpbBuilder_dispose(dpb);
+
+  if (fb_check_status(fbc->st))
+  {
+    fb_log_error("attachDatabase", fbc->st);
+    goto error;
+  }
+
+  fbc->tra = NULL;
+  sb_conn->ptr = fbc;
   return 0;
+
+error:
+  if (fbc->st) IStatus_dispose(fbc->st);
+  free(fbc);
+  return 1;
 }
 
 
 int firebird_drv_disconnect(db_conn_t *sb_conn)
 {
-  ISC_STATUS_ARRAY status;
   fb_conn_t *fbc = (fb_conn_t *)sb_conn->ptr;
 
   xfree(sb_conn->sql_state);
@@ -642,18 +775,21 @@ int firebird_drv_disconnect(db_conn_t *sb_conn)
   if (fbc == NULL)
     return 0;
 
-  if (fbc->trans != 0)
+  fb_batch_close(fbc);
+
+  if (fbc->tra != NULL)
   {
-    isc_rollback_transaction(status, &fbc->trans);
-    fbc->trans = 0;
+    ITransaction_rollback(fbc->tra, fbc->st);
+    fbc->tra = NULL;
   }
 
-  if (fbc->db != 0)
+  if (fbc->att != NULL)
   {
-    isc_detach_database(status, &fbc->db);
-    fbc->db = 0;
+    IAttachment_detach(fbc->att, fbc->st);
+    fbc->att = NULL;
   }
 
+  IStatus_dispose(fbc->st);
   free(fbc);
   sb_conn->ptr = NULL;
 
@@ -678,11 +814,8 @@ int firebird_drv_reconnect(db_conn_t *sb_conn)
 
 int firebird_drv_prepare(db_stmt_t *stmt, const char *query, size_t len)
 {
-  ISC_STATUS_ARRAY status;
   fb_conn_t *fbc = (fb_conn_t *)stmt->connection->ptr;
   fb_stmt_t *fbstmt = NULL;
-  int rc = 1;
-  int n;
 
   (void)len;
 
@@ -703,84 +836,52 @@ int firebird_drv_prepare(db_stmt_t *stmt, const char *query, size_t len)
   if (fbstmt == NULL)
     return 1;
 
-  if (fb_ensure_transaction(fbc, status))
+  if (fb_ensure_transaction(fbc))
     goto error;
 
-  if (isc_dsql_allocate_statement(status, &fbc->db, &fbstmt->stmt))
+  IStatus_init(fbc->st);
+  fbstmt->stmt = IAttachment_prepare(fbc->att, fbc->st, fbc->tra, 0, query,
+                                      FB_DIALECT,
+                                      IStatement_PREPARE_PREFETCH_METADATA);
+  if (fb_check_status(fbc->st))
   {
-    fb_log_error("isc_dsql_allocate_statement", status);
-    goto error;
-  }
-
-  fbstmt->out_sqlda = fb_alloc_sqlda(20);
-  if (fbstmt->out_sqlda == NULL)
-    goto error;
-
-  if (isc_dsql_prepare(status, &fbc->trans, &fbstmt->stmt, 0, query,
-                        SQL_DIALECT_V6, fbstmt->out_sqlda))
-  {
-    fb_log_error("isc_dsql_prepare", status);
+    fb_log_error("prepare", fbc->st);
     goto error;
   }
 
-  if (fbstmt->out_sqlda->sqld > fbstmt->out_sqlda->sqln)
-  {
-    n = fbstmt->out_sqlda->sqld;
-    free(fbstmt->out_sqlda);
-    fbstmt->out_sqlda = fb_alloc_sqlda(n);
-    if (fbstmt->out_sqlda == NULL)
-      goto error;
-    if (isc_dsql_describe(status, &fbstmt->stmt, SQL_DIALECT_V6,
-                          fbstmt->out_sqlda))
-    {
-      fb_log_error("isc_dsql_describe", status);
-      goto error;
-    }
-  }
+  fbstmt->out_meta = IStatement_getOutputMetadata(fbstmt->stmt, fbc->st);
+  fbstmt->in_meta = IStatement_getInputMetadata(fbstmt->stmt, fbc->st);
 
-  if (fbstmt->out_sqlda->sqld > 0)
+  fbstmt->nfields = IMessageMetadata_getCount(fbstmt->out_meta, fbc->st);
+  fbstmt->nparams = IMessageMetadata_getCount(fbstmt->in_meta, fbc->st);
+
+  fbstmt->out_buf_len = IMessageMetadata_getMessageLength(fbstmt->out_meta,
+                                                           fbc->st);
+  fbstmt->in_buf_len = IMessageMetadata_getMessageLength(fbstmt->in_meta,
+                                                          fbc->st);
+
+  if (fbstmt->out_buf_len > 0)
   {
-    if (fb_allocate_output_buffers(fbstmt->out_sqlda))
+    fbstmt->out_buf = (unsigned char *)calloc(1, fbstmt->out_buf_len);
+    if (fbstmt->out_buf == NULL)
       goto error;
   }
 
-  fbstmt->in_sqlda = fb_alloc_sqlda(20);
-  if (fbstmt->in_sqlda == NULL)
-    goto error;
-
-  if (isc_dsql_describe_bind(status, &fbstmt->stmt, SQL_DIALECT_V6,
-                              fbstmt->in_sqlda))
+  if (fbstmt->in_buf_len > 0)
   {
-    fb_log_error("isc_dsql_describe_bind", status);
-    goto error;
-  }
-
-  if (fbstmt->in_sqlda->sqld > fbstmt->in_sqlda->sqln)
-  {
-    n = fbstmt->in_sqlda->sqld;
-    free(fbstmt->in_sqlda);
-    fbstmt->in_sqlda = fb_alloc_sqlda(n);
-    if (fbstmt->in_sqlda == NULL)
+    fbstmt->in_buf = (unsigned char *)calloc(1, fbstmt->in_buf_len);
+    if (fbstmt->in_buf == NULL)
       goto error;
-    if (isc_dsql_describe_bind(status, &fbstmt->stmt, SQL_DIALECT_V6,
-                                fbstmt->in_sqlda))
-    {
-      fb_log_error("isc_dsql_describe_bind", status);
-      goto error;
-    }
   }
-
-  fbstmt->nparams = fbstmt->in_sqlda->sqld;
-  fbstmt->nfields = (uint32_t)fbstmt->out_sqlda->sqld;
-  fbstmt->prepared = 1;
 
   if (fbstmt->nfields > 0)
   {
-    fbstmt->cached_values = (db_value_t *)calloc(fbstmt->nfields, sizeof(db_value_t));
+    fbstmt->cached_values = (db_value_t *)calloc(fbstmt->nfields,
+                                                  sizeof(db_value_t));
     fbstmt->conv_bufs = (char **)calloc(fbstmt->nfields, sizeof(char *));
     if (fbstmt->cached_values == NULL || fbstmt->conv_bufs == NULL)
       goto error;
-    for (uint32_t i = 0; i < fbstmt->nfields; i++)
+    for (unsigned i = 0; i < fbstmt->nfields; i++)
     {
       fbstmt->conv_bufs[i] = (char *)malloc(MAX_COLUMN_LENGTH);
       if (fbstmt->conv_bufs[i] == NULL)
@@ -788,18 +889,7 @@ int firebird_drv_prepare(db_stmt_t *stmt, const char *query, size_t len)
     }
   }
 
-  for (int i = 0; i < fbstmt->nparams; i++)
-  {
-    XSQLVAR *var = &fbstmt->in_sqlda->sqlvar[i];
-    var->sqldata = (char *)calloc(1, MAX_PARAM_LENGTH + 2);
-    if (var->sqldata == NULL)
-      goto error;
-    var->sqlind = (short *)malloc(sizeof(short));
-    if (var->sqlind == NULL)
-      goto error;
-    *var->sqlind = 0;
-  }
-
+  fbstmt->prepared = 1;
   stmt->ptr = fbstmt;
   stmt->query = strdup(query);
 
@@ -808,33 +898,21 @@ int firebird_drv_prepare(db_stmt_t *stmt, const char *query, size_t len)
 error:
   if (fbstmt != NULL)
   {
-    if (fbstmt->in_sqlda != NULL)
-    {
-      for (int i = 0; i < fbstmt->in_sqlda->sqld; i++)
-      {
-        xfree(fbstmt->in_sqlda->sqlvar[i].sqldata);
-        xfree(fbstmt->in_sqlda->sqlvar[i].sqlind);
-      }
-      free(fbstmt->in_sqlda);
-    }
     if (fbstmt->conv_bufs != NULL)
     {
-      for (uint32_t i = 0; i < fbstmt->nfields; i++)
-        if (fbstmt->conv_bufs[i]) free(fbstmt->conv_bufs[i]);
+      for (unsigned i = 0; i < fbstmt->nfields; i++)
+        free(fbstmt->conv_bufs[i]);
       free(fbstmt->conv_bufs);
     }
     free(fbstmt->cached_values);
-    if (fbstmt->out_sqlda != NULL)
-    {
-      fb_free_sqlda_buffers(fbstmt->out_sqlda);
-      free(fbstmt->out_sqlda);
-    }
-    if (fbstmt->stmt != 0)
-      isc_dsql_free_statement(status, &fbstmt->stmt, DSQL_drop);
+    free(fbstmt->out_buf);
+    free(fbstmt->in_buf);
+    if (fbstmt->out_meta) IMessageMetadata_release(fbstmt->out_meta);
+    if (fbstmt->in_meta) IMessageMetadata_release(fbstmt->in_meta);
+    if (fbstmt->stmt) IStatement_free(fbstmt->stmt, fbc->st);
     free(fbstmt);
   }
-
-  return rc;
+  return 1;
 }
 
 
@@ -857,7 +935,7 @@ int firebird_drv_bind_param(db_stmt_t *stmt, db_bind_t *params, size_t len)
   if (fbstmt == NULL || !fbstmt->prepared)
     return 1;
 
-  if ((unsigned)fbstmt->nparams != len)
+  if (fbstmt->nparams != (unsigned)len)
   {
     log_text(LOG_ALERT, "wrong number of parameters in prepared statement");
     return 1;
@@ -869,68 +947,58 @@ int firebird_drv_bind_param(db_stmt_t *stmt, db_bind_t *params, size_t len)
 
 int firebird_drv_bind_result(db_stmt_t *stmt, db_bind_t *params, size_t len)
 {
-  (void)stmt;
-  (void)params;
-  (void)len;
+  (void)stmt; (void)params; (void)len;
   return 0;
 }
 
 
-static void fb_set_param(XSQLVAR *var, db_bind_t *bind)
+static void fb_set_param(fb_stmt_t *fbstmt, struct IStatus *st,
+                         unsigned idx, db_bind_t *bind)
 {
+  unsigned off = IMessageMetadata_getOffset(fbstmt->in_meta, st, idx);
+  unsigned nullOff = IMessageMetadata_getNullOffset(fbstmt->in_meta, st, idx);
+
   if (bind->is_null && *bind->is_null)
   {
-    *var->sqlind = -1;
+    *(short *)(fbstmt->in_buf + nullOff) = -1;
     return;
   }
 
-  *var->sqlind = 0;
+  *(short *)(fbstmt->in_buf + nullOff) = 0;
 
   switch (bind->type)
   {
   case DB_TYPE_TINYINT:
   case DB_TYPE_SMALLINT:
   {
-    short val;
-    if (bind->type == DB_TYPE_TINYINT)
-      val = (short)(*(char *)bind->buffer);
-    else
-      val = *(short *)bind->buffer;
-    var->sqltype = SQL_SHORT + 1;
-    var->sqllen = sizeof(short);
-    memcpy(var->sqldata, &val, sizeof(short));
+    short val = (bind->type == DB_TYPE_TINYINT)
+      ? (short)(*(char *)bind->buffer)
+      : *(short *)bind->buffer;
+    memcpy(fbstmt->in_buf + off, &val, sizeof(short));
     break;
   }
   case DB_TYPE_INT:
   {
     ISC_LONG val = *(int *)bind->buffer;
-    var->sqltype = SQL_LONG + 1;
-    var->sqllen = sizeof(ISC_LONG);
-    memcpy(var->sqldata, &val, sizeof(ISC_LONG));
+    memcpy(fbstmt->in_buf + off, &val, sizeof(ISC_LONG));
     break;
   }
   case DB_TYPE_BIGINT:
   {
     ISC_INT64 val = *(long long *)bind->buffer;
-    var->sqltype = SQL_INT64 + 1;
-    var->sqllen = sizeof(ISC_INT64);
-    memcpy(var->sqldata, &val, sizeof(ISC_INT64));
+    memcpy(fbstmt->in_buf + off, &val, sizeof(ISC_INT64));
     break;
   }
   case DB_TYPE_FLOAT:
   {
     float val = *(float *)bind->buffer;
-    var->sqltype = SQL_FLOAT + 1;
-    var->sqllen = sizeof(float);
-    memcpy(var->sqldata, &val, sizeof(float));
+    memcpy(fbstmt->in_buf + off, &val, sizeof(float));
     break;
   }
   case DB_TYPE_DOUBLE:
   {
     double val = *(double *)bind->buffer;
-    var->sqltype = SQL_DOUBLE + 1;
-    var->sqllen = sizeof(double);
-    memcpy(var->sqldata, &val, sizeof(double));
+    memcpy(fbstmt->in_buf + off, &val, sizeof(double));
     break;
   }
   case DB_TYPE_CHAR:
@@ -939,28 +1007,47 @@ static void fb_set_param(XSQLVAR *var, db_bind_t *bind)
     unsigned long data_len = bind->data_len
       ? *bind->data_len
       : strlen((char *)bind->buffer);
-    if (data_len > MAX_PARAM_LENGTH)
-      data_len = MAX_PARAM_LENGTH;
+    unsigned meta_type = IMessageMetadata_getType(fbstmt->in_meta, st, idx) & ~1;
+    unsigned meta_len = IMessageMetadata_getLength(fbstmt->in_meta, st, idx);
 
-    ISC_USHORT vary_len = (ISC_USHORT)data_len;
-    memcpy(var->sqldata, &vary_len, sizeof(ISC_USHORT));
-    memcpy(var->sqldata + sizeof(ISC_USHORT), bind->buffer, data_len);
-
-    var->sqltype = SQL_VARYING + 1;
-    var->sqllen = (short)data_len;
+    if (meta_type == SQL_TEXT)
+    {
+      unsigned copy_len = data_len < meta_len ? data_len : meta_len;
+      memcpy(fbstmt->in_buf + off, bind->buffer, copy_len);
+      if (copy_len < meta_len)
+        memset(fbstmt->in_buf + off + copy_len, ' ', meta_len - copy_len);
+    }
+    else
+    {
+      if (data_len > meta_len) data_len = meta_len;
+      ISC_USHORT vary_len = (ISC_USHORT)data_len;
+      memcpy(fbstmt->in_buf + off, &vary_len, sizeof(ISC_USHORT));
+      memcpy(fbstmt->in_buf + off + sizeof(ISC_USHORT), bind->buffer, data_len);
+    }
     break;
   }
   default:
   {
-    char buf[MAX_PARAM_LENGTH];
+    char buf[256];
     int n = db_print_value(bind, buf, sizeof(buf));
     if (n > 0)
     {
-      ISC_USHORT vary_len = (ISC_USHORT)n;
-      memcpy(var->sqldata, &vary_len, sizeof(ISC_USHORT));
-      memcpy(var->sqldata + sizeof(ISC_USHORT), buf, n);
-      var->sqltype = SQL_VARYING + 1;
-      var->sqllen = (short)n;
+      unsigned meta_type = IMessageMetadata_getType(fbstmt->in_meta, st, idx) & ~1;
+      unsigned meta_len = IMessageMetadata_getLength(fbstmt->in_meta, st, idx);
+      if (meta_type == SQL_TEXT)
+      {
+        unsigned copy_len = (unsigned)n < meta_len ? (unsigned)n : meta_len;
+        memcpy(fbstmt->in_buf + off, buf, copy_len);
+        if (copy_len < meta_len)
+          memset(fbstmt->in_buf + off + copy_len, ' ', meta_len - copy_len);
+      }
+      else
+      {
+        if ((unsigned)n > meta_len) n = (int)meta_len;
+        ISC_USHORT vary_len = (ISC_USHORT)n;
+        memcpy(fbstmt->in_buf + off, &vary_len, sizeof(ISC_USHORT));
+        memcpy(fbstmt->in_buf + off + sizeof(ISC_USHORT), buf, n);
+      }
     }
     break;
   }
@@ -970,7 +1057,6 @@ static void fb_set_param(XSQLVAR *var, db_bind_t *bind)
 
 db_error_t firebird_drv_execute(db_stmt_t *stmt, db_result_t *rs)
 {
-  ISC_STATUS_ARRAY status;
   db_conn_t *con = stmt->connection;
   fb_conn_t *fbc = (fb_conn_t *)con->ptr;
   fb_stmt_t *fbstmt;
@@ -981,8 +1067,8 @@ db_error_t firebird_drv_execute(db_stmt_t *stmt, db_result_t *rs)
   int n;
 
   con->sql_errno = 0;
-  con->sql_state = NULL;
-  con->sql_errmsg = NULL;
+  xfree(con->sql_state);
+  xfree(con->sql_errmsg);
 
   if (!stmt->emulated)
   {
@@ -995,56 +1081,166 @@ db_error_t firebird_drv_execute(db_stmt_t *stmt, db_result_t *rs)
 
     if (fbstmt->cursor_open)
     {
-      isc_dsql_free_statement(status, &fbstmt->stmt, DSQL_close);
+      IResultSet_close(fbstmt->cursor, fbc->st);
+      fbstmt->cursor = NULL;
       fbstmt->cursor_open = 0;
     }
 
-    for (i = 0; i < (unsigned)fbstmt->nparams; i++)
-      fb_set_param(&fbstmt->in_sqlda->sqlvar[i], &stmt->bound_param[i]);
+    for (i = 0; i < fbstmt->nparams; i++)
+      fb_set_param(fbstmt, fbc->st, i, &stmt->bound_param[i]);
 
-    if (fb_ensure_transaction(fbc, status))
+    if (fb_ensure_transaction(fbc))
       return DB_ERROR_FATAL;
 
-    if (isc_dsql_execute(status, &fbc->trans, &fbstmt->stmt, SQL_DIALECT_V6,
-                          fbstmt->nparams > 0 ? fbstmt->in_sqlda : NULL))
-      return fb_check_error(con, status, "isc_dsql_execute", stmt->query,
-                            &rs->counter);
+    IStatus_init(fbc->st);
 
     if (fbstmt->nfields > 0)
     {
-      rs->counter = SB_CNT_READ;
+      fbstmt->cursor = IStatement_openCursor(fbstmt->stmt, fbc->st, fbc->tra,
+          fbstmt->nparams > 0 ? fbstmt->in_meta : NULL,
+          fbstmt->nparams > 0 ? fbstmt->in_buf : NULL,
+          fbstmt->out_meta, 0);
 
-      ISC_STATUS fetch_stat;
-      uint32_t row_count = 0;
-
-      fetch_stat = isc_dsql_fetch(status, &fbstmt->stmt, SQL_DIALECT_V6,
-                                   fbstmt->out_sqlda);
-
-      if (fetch_stat == 0)
-      {
-        for (uint32_t ci = 0; ci < fbstmt->nfields; ci++)
-          fb_extract_column_fast(&fbstmt->out_sqlda->sqlvar[ci],
-                                 &fbstmt->cached_values[ci],
-                                 fbstmt->conv_bufs[ci]);
-        row_count = 1;
-
-        while ((fetch_stat = isc_dsql_fetch(status, &fbstmt->stmt,
-                                             SQL_DIALECT_V6,
-                                             fbstmt->out_sqlda)) == 0)
-          row_count++;
-      }
-
-      if (fetch_stat != 100 && fetch_stat != 0)
-        return fb_check_error(con, status, "isc_dsql_fetch", stmt->query,
-                              &rs->counter);
+      if (fb_check_status(fbc->st))
+        return fb_handle_error(con, fbc, "openCursor", stmt->query,
+                               &rs->counter);
 
       fbstmt->cursor_open = 1;
-      rs->nrows = row_count;
-      rs->nfields = fbstmt->nfields;
-      rs->ptr = fbstmt;
+      rs->counter = SB_CNT_READ;
 
-      return DB_ERROR_NONE;
+      int fetch_rc = IResultSet_fetchNext(fbstmt->cursor, fbc->st,
+                                           fbstmt->out_buf);
+
+      if (fetch_rc == IStatus_RESULT_OK)
+      {
+        for (unsigned ci = 0; ci < fbstmt->nfields; ci++)
+          fb_extract_column_fast(fbstmt->out_meta, fbc->st, fbstmt->out_buf,
+                                  ci, &fbstmt->cached_values[ci],
+                                  fbstmt->conv_bufs[ci]);
+
+        unsigned char *row0_buf = malloc(fbstmt->out_buf_len);
+        if (row0_buf != NULL)
+          memcpy(row0_buf, fbstmt->out_buf, fbstmt->out_buf_len);
+
+        int second = IResultSet_fetchNext(fbstmt->cursor, fbc->st,
+                                           fbstmt->out_buf);
+
+        if (second == IStatus_RESULT_NO_DATA)
+        {
+          free(row0_buf);
+          rs->nrows = 1;
+          rs->nfields = fbstmt->nfields;
+          rs->ptr = fbstmt;
+          return DB_ERROR_NONE;
+        }
+
+        if (second == IStatus_RESULT_OK)
+        {
+          fb_result_t *fbrs = (fb_result_t *)calloc(1, sizeof(fb_result_t));
+          if (fbrs == NULL)
+          {
+            free(row0_buf);
+            return DB_ERROR_FATAL;
+          }
+          unsigned capacity = 64;
+          fbrs->nfields = fbstmt->nfields;
+          fbrs->values = (db_value_t *)calloc(capacity * fbstmt->nfields,
+                                               sizeof(db_value_t));
+          if (fbrs->values == NULL)
+          {
+            free(row0_buf);
+            free(fbrs);
+            return DB_ERROR_FATAL;
+          }
+
+          /* Row 0: re-extract from row0_buf snapshot taken before second fetch */
+          for (unsigned ci = 0; ci < fbstmt->nfields; ci++)
+          {
+            uint32_t col_len = 0;
+            char *s = fb_extract_column_alloc(fbstmt->out_meta, fbc->st,
+                row0_buf, ci, &col_len);
+            fbrs->values[ci].ptr = s;
+            fbrs->values[ci].len = col_len;
+            fb_result_add_string(fbrs, s);
+          }
+          free(row0_buf);
+          unsigned nrows = 1;
+
+          /* Row 1: extract from current out_buf (second fetch result) */
+          if (nrows >= capacity)
+          {
+            capacity *= 2;
+            db_value_t *nv = realloc(fbrs->values,
+                capacity * fbstmt->nfields * sizeof(db_value_t));
+            if (nv == NULL) { fb_free_result(fbrs); return DB_ERROR_FATAL; }
+            fbrs->values = nv;
+          }
+          for (unsigned ci = 0; ci < fbstmt->nfields; ci++)
+          {
+            uint32_t col_len = 0;
+            char *s = fb_extract_column_alloc(fbstmt->out_meta, fbc->st,
+                fbstmt->out_buf, ci, &col_len);
+            fbrs->values[nrows * fbstmt->nfields + ci].ptr = s;
+            fbrs->values[nrows * fbstmt->nfields + ci].len = col_len;
+            fb_result_add_string(fbrs, s);
+          }
+          nrows++;
+
+          while ((fetch_rc = IResultSet_fetchNext(fbstmt->cursor, fbc->st,
+                                                   fbstmt->out_buf))
+                 == IStatus_RESULT_OK)
+          {
+            if (nrows >= capacity)
+            {
+              capacity *= 2;
+              db_value_t *nv = realloc(fbrs->values,
+                  capacity * fbstmt->nfields * sizeof(db_value_t));
+              if (nv == NULL) { fb_free_result(fbrs); return DB_ERROR_FATAL; }
+              fbrs->values = nv;
+            }
+            for (unsigned ci = 0; ci < fbstmt->nfields; ci++)
+            {
+              uint32_t col_len = 0;
+              char *s = fb_extract_column_alloc(fbstmt->out_meta, fbc->st,
+                  fbstmt->out_buf, ci, &col_len);
+              fbrs->values[nrows * fbstmt->nfields + ci].ptr = s;
+              fbrs->values[nrows * fbstmt->nfields + ci].len = col_len;
+              fb_result_add_string(fbrs, s);
+            }
+            nrows++;
+          }
+
+          fbrs->nrows = nrows;
+          rs->nrows = nrows;
+          rs->nfields = fbstmt->nfields;
+          rs->ptr = fbrs;
+          return DB_ERROR_NONE;
+        }
+
+        free(row0_buf);
+        return fb_handle_error(con, fbc, "fetchNext", stmt->query,
+                               &rs->counter);
+      }
+
+      if (fetch_rc == IStatus_RESULT_NO_DATA)
+      {
+        rs->nrows = 0;
+        rs->nfields = fbstmt->nfields;
+        rs->ptr = fbstmt;
+        return DB_ERROR_NONE;
+      }
+
+      return fb_handle_error(con, fbc, "fetchNext", stmt->query,
+                             &rs->counter);
     }
+
+    IStatement_execute(fbstmt->stmt, fbc->st, fbc->tra,
+        fbstmt->nparams > 0 ? fbstmt->in_meta : NULL,
+        fbstmt->nparams > 0 ? fbstmt->in_buf : NULL,
+        NULL, NULL);
+
+    if (fb_check_status(fbc->st))
+      return fb_handle_error(con, fbc, "execute", stmt->query, &rs->counter);
 
     rs->counter = SB_CNT_WRITE;
     rs->nrows = 1;
@@ -1092,26 +1288,35 @@ db_error_t firebird_drv_execute(db_stmt_t *stmt, db_result_t *rs)
 db_error_t firebird_drv_query(db_conn_t *sb_conn, const char *query, size_t len,
                               db_result_t *rs)
 {
-  ISC_STATUS_ARRAY status;
   fb_conn_t *fbc = (fb_conn_t *)sb_conn->ptr;
 
   (void)len;
 
   sb_conn->sql_errno = 0;
-  sb_conn->sql_state = NULL;
-  sb_conn->sql_errmsg = NULL;
+  xfree(sb_conn->sql_state);
+  xfree(sb_conn->sql_errmsg);
 
-  /* Intercept transaction control statements */
+  /* Intercept transaction control */
   if (strcasecmp(query, "BEGIN") == 0)
   {
-    if (fbc->trans != 0)
+    if (fbc->tra != NULL)
     {
-      isc_commit_transaction(status, &fbc->trans);
-      fbc->trans = 0;
+      IStatus_init(fbc->st);
+      ITransaction_commit(fbc->tra, fbc->st);
+      fbc->tra = NULL;
+      if (fb_check_status(fbc->st))
+      {
+        fb_log_error("commit(implicit in BEGIN)", fbc->st);
+        rs->counter = SB_CNT_ERROR;
+        return DB_ERROR_FATAL;
+      }
     }
-    if (isc_start_transaction(status, &fbc->trans, 1, &fbc->db, 0, NULL))
+    IStatus_init(fbc->st);
+    fbc->tra = IAttachment_startTransaction(fbc->att, fbc->st, 0, NULL);
+    if (fb_check_status(fbc->st))
     {
-      fb_log_error("isc_start_transaction", status);
+      fb_log_error("startTransaction", fbc->st);
+      fbc->tra = NULL;
       rs->counter = SB_CNT_ERROR;
       return DB_ERROR_FATAL;
     }
@@ -1122,16 +1327,20 @@ db_error_t firebird_drv_query(db_conn_t *sb_conn, const char *query, size_t len,
 
   if (strcasecmp(query, "COMMIT") == 0)
   {
-    if (fbc->trans != 0)
+    fb_batch_close(fbc);
+
+    if (fbc->tra != NULL)
     {
-      if (isc_commit_transaction(status, &fbc->trans))
+      IStatus_init(fbc->st);
+      ITransaction_commit(fbc->tra, fbc->st);
+      if (fb_check_status(fbc->st))
       {
-        fb_log_error("isc_commit_transaction", status);
-        fbc->trans = 0;
+        fb_log_error("commit", fbc->st);
+        fbc->tra = NULL;
         rs->counter = SB_CNT_ERROR;
         return DB_ERROR_FATAL;
       }
-      fbc->trans = 0;
+      fbc->tra = NULL;
     }
     rs->counter = SB_CNT_OTHER;
     rs->nrows = 0;
@@ -1140,17 +1349,17 @@ db_error_t firebird_drv_query(db_conn_t *sb_conn, const char *query, size_t len,
 
   if (strcasecmp(query, "ROLLBACK") == 0)
   {
-    if (fbc->trans != 0)
+    if (fbc->tra != NULL)
     {
-      isc_rollback_transaction(status, &fbc->trans);
-      fbc->trans = 0;
+      ITransaction_rollback(fbc->tra, fbc->st);
+      fbc->tra = NULL;
     }
     rs->counter = SB_CNT_OTHER;
     rs->nrows = 0;
     return DB_ERROR_NONE;
   }
 
-  /* Handle CREATE TABLE IF NOT EXISTS — strip IF NOT EXISTS, ignore -607 */
+  /* Handle CREATE TABLE IF NOT EXISTS */
   {
     const char *q = query;
     while (*q == ' ' || *q == '\t' || *q == '\n' || *q == '\r')
@@ -1160,46 +1369,43 @@ db_error_t firebird_drv_query(db_conn_t *sb_conn, const char *query, size_t len,
       char create_buf[4096];
       snprintf(create_buf, sizeof(create_buf), "CREATE TABLE %s", q + 27);
 
-    int auto_txn_create = (fbc->trans == 0);
-    if (auto_txn_create && fb_ensure_transaction(fbc, status))
-    {
-      rs->counter = SB_CNT_ERROR;
-      return DB_ERROR_FATAL;
-    }
-
-    if (isc_dsql_execute_immediate(status, &fbc->db, &fbc->trans, 0,
-                                    create_buf, SQL_DIALECT_V6, NULL))
-    {
-      long sqlcode = isc_sqlcode(status);
-      if (sqlcode == -607)
+      int auto_txn = (fbc->tra == NULL);
+      if (auto_txn && fb_ensure_transaction(fbc))
       {
-        ISC_STATUS_ARRAY rb_status;
-        isc_rollback_transaction(rb_status, &fbc->trans);
-        fbc->trans = 0;
-        rs->counter = SB_CNT_OTHER;
-        rs->nrows = 0;
-        return DB_ERROR_NONE;
+        rs->counter = SB_CNT_ERROR;
+        return DB_ERROR_FATAL;
       }
-      fb_log_error("isc_dsql_execute_immediate", status);
-      if (auto_txn_create)
+
+      IStatus_init(fbc->st);
+      IAttachment_execute(fbc->att, fbc->st, fbc->tra, 0, create_buf,
+                          FB_DIALECT, NULL, NULL, NULL, NULL);
+
+      if (fb_check_status(fbc->st))
       {
-        ISC_STATUS_ARRAY rb_status;
-        isc_rollback_transaction(rb_status, &fbc->trans);
-        fbc->trans = 0;
+        long sqlcode = isc_sqlcode(IStatus_getErrors(fbc->st));
+        if (sqlcode == -607)
+        {
+          if (auto_txn)
+          {
+            struct IStatus *rst = IMaster_getStatus(fb_master);
+            ITransaction_rollback(fbc->tra, rst);
+            IStatus_dispose(rst);
+            fbc->tra = NULL;
+          }
+          rs->counter = SB_CNT_OTHER;
+          rs->nrows = 0;
+          return DB_ERROR_NONE;
+        }
+        fb_log_error("execute(CREATE IF NOT EXISTS)", fbc->st);
+        if (auto_txn) { struct IStatus *rst = IMaster_getStatus(fb_master); ITransaction_rollback(fbc->tra, rst); IStatus_dispose(rst); fbc->tra = NULL; }
+        rs->counter = SB_CNT_ERROR;
+        return DB_ERROR_FATAL;
       }
-      rs->counter = SB_CNT_ERROR;
-      return DB_ERROR_FATAL;
-    }
 
-    if (auto_txn_create)
-    {
-      isc_commit_transaction(status, &fbc->trans);
-      fbc->trans = 0;
-    }
-
-    rs->counter = SB_CNT_OTHER;
-    rs->nrows = 0;
-    return DB_ERROR_NONE;
+      if (auto_txn) { ITransaction_commit(fbc->tra, fbc->st); fbc->tra = NULL; }
+      rs->counter = SB_CNT_OTHER;
+      rs->nrows = 0;
+      return DB_ERROR_NONE;
     }
   }
 
@@ -1209,170 +1415,251 @@ db_error_t firebird_drv_query(db_conn_t *sb_conn, const char *query, size_t len,
     char drop_buf[256];
     snprintf(drop_buf, sizeof(drop_buf), "DROP TABLE %s", query + 21);
 
-    int auto_txn_drop = (fbc->trans == 0);
-    if (auto_txn_drop && fb_ensure_transaction(fbc, status))
+    int auto_txn = (fbc->tra == NULL);
+    if (auto_txn && fb_ensure_transaction(fbc))
     {
       rs->counter = SB_CNT_ERROR;
       return DB_ERROR_FATAL;
     }
 
-    if (isc_dsql_execute_immediate(status, &fbc->db, &fbc->trans, 0,
-                                    drop_buf, SQL_DIALECT_V6, NULL))
+    IStatus_init(fbc->st);
+    IAttachment_execute(fbc->att, fbc->st, fbc->tra, 0, drop_buf,
+                        FB_DIALECT, NULL, NULL, NULL, NULL);
+
+    if (fb_check_status(fbc->st))
     {
-      long sqlcode = isc_sqlcode(status);
+      long sqlcode = isc_sqlcode(IStatus_getErrors(fbc->st));
       if (sqlcode == -607)
       {
-        ISC_STATUS_ARRAY rb_status;
-        isc_rollback_transaction(rb_status, &fbc->trans);
-        fbc->trans = 0;
+        if (auto_txn)
+        {
+          struct IStatus *rst = IMaster_getStatus(fb_master);
+          ITransaction_rollback(fbc->tra, rst);
+          IStatus_dispose(rst);
+          fbc->tra = NULL;
+        }
         rs->counter = SB_CNT_OTHER;
         rs->nrows = 0;
         return DB_ERROR_NONE;
       }
-      fb_log_error("isc_dsql_execute_immediate", status);
-      if (auto_txn_drop)
-      {
-        ISC_STATUS_ARRAY rb_status;
-        isc_rollback_transaction(rb_status, &fbc->trans);
-        fbc->trans = 0;
-      }
+      fb_log_error("execute(DROP IF EXISTS)", fbc->st);
+      if (auto_txn) { struct IStatus *rst = IMaster_getStatus(fb_master); ITransaction_rollback(fbc->tra, rst); IStatus_dispose(rst); fbc->tra = NULL; }
       rs->counter = SB_CNT_ERROR;
       return DB_ERROR_FATAL;
     }
 
-    if (auto_txn_drop)
-    {
-      isc_commit_transaction(status, &fbc->trans);
-      fbc->trans = 0;
-    }
-
+    if (auto_txn) { ITransaction_commit(fbc->tra, fbc->st); fbc->tra = NULL; }
     rs->counter = SB_CNT_OTHER;
     rs->nrows = 0;
     return DB_ERROR_NONE;
   }
 
-  /* Regular query */
-  int auto_txn = (fbc->trans == 0);
-  if (auto_txn && fb_ensure_transaction(fbc, status))
+  /* Batch INSERT optimization — detect "INSERT INTO ... VALUES(...)" */
+  if (strncasecmp(query, "INSERT INTO ", 12) == 0)
+  {
+    const char *vals = strstr(query, "VALUES");
+    if (vals == NULL) vals = strstr(query, "values");
+    if (vals != NULL)
+    {
+      unsigned base_len = (unsigned)(vals + 6 - query);
+      char base_sql[512];
+      if (base_len < sizeof(base_sql))
+      {
+        memcpy(base_sql, query, base_len);
+        base_sql[base_len] = '\0';
+
+        if (fbc->batch == NULL || fbc->batch_base_sql == NULL ||
+            strncmp(fbc->batch_base_sql, base_sql, base_len) != 0)
+        {
+          fb_batch_close(fbc);
+
+          unsigned ncols = 1;
+          for (const char *c = vals + 6; *c && *c != ')'; c++)
+          {
+            if (*c == '\'')
+            {
+              c++;
+              while (*c && !(*c == '\'' && *(c + 1) != '\''))
+              {
+                if (*c == '\'' && *(c + 1) == '\'') c++;
+                c++;
+              }
+            }
+            else if (*c == ',') ncols++;
+          }
+
+          fbc->batch_auto_txn = (fbc->tra == NULL);
+          if (fb_ensure_transaction(fbc))
+          {
+            rs->counter = SB_CNT_ERROR;
+            return DB_ERROR_FATAL;
+          }
+
+          int brc = fb_batch_create(fbc, base_sql, ncols);
+          if (brc == 1)
+          {
+            rs->counter = SB_CNT_ERROR;
+            return DB_ERROR_FATAL;
+          }
+          if (brc == -1)
+            goto regular_query;
+        }
+
+        if (fbc->batch != NULL && fb_batch_add_row(fbc, vals + 6) == 0)
+        {
+          rs->counter = SB_CNT_WRITE;
+          rs->nrows = 1;
+          rs->ptr = NULL;
+          return DB_ERROR_NONE;
+        }
+      }
+    }
+  }
+
+regular_query:
+  /* Regular query via direct execution */
+  int auto_txn = (fbc->tra == NULL);
+  if (auto_txn && fb_ensure_transaction(fbc))
   {
     rs->counter = SB_CNT_ERROR;
     return DB_ERROR_FATAL;
   }
 
-  isc_stmt_handle tmp_stmt = 0;
+  /* Try as DML/DDL first via execute */
+  IStatus_init(fbc->st);
 
-  if (isc_dsql_allocate_statement(status, &fbc->db, &tmp_stmt))
+  struct IStatement *tmp_stmt = IAttachment_prepare(fbc->att, fbc->st,
+      fbc->tra, 0, query, FB_DIALECT, IStatement_PREPARE_PREFETCH_METADATA);
+
+  if (fb_check_status(fbc->st))
   {
-    fb_log_error("isc_dsql_allocate_statement", status);
-    rs->counter = SB_CNT_ERROR;
-    return DB_ERROR_FATAL;
-  }
-
-  XSQLDA *out_sqlda = fb_alloc_sqlda(20);
-  if (out_sqlda == NULL)
-    goto query_error;
-
-  if (isc_dsql_prepare(status, &fbc->trans, &tmp_stmt, 0, query,
-                        SQL_DIALECT_V6, out_sqlda))
-  {
-    ISC_STATUS_ARRAY saved_status;
-    memcpy(saved_status, status, sizeof(ISC_STATUS_ARRAY));
-
-    free(out_sqlda);
-    ISC_STATUS_ARRAY cleanup_status;
-    isc_dsql_free_statement(cleanup_status, &tmp_stmt, DSQL_drop);
-    if (auto_txn)
+    db_error_t err = fb_handle_error(sb_conn, fbc, "prepare", query,
+                                      &rs->counter);
+    if (auto_txn && fbc->tra)
     {
-      isc_rollback_transaction(cleanup_status, &fbc->trans);
-      fbc->trans = 0;
+      struct IStatus *rst = IMaster_getStatus(fb_master);
+      ITransaction_rollback(fbc->tra, rst);
+      IStatus_dispose(rst);
+      fbc->tra = NULL;
     }
-    return fb_check_error(sb_conn, saved_status, "isc_dsql_prepare", query,
-                          &rs->counter);
+    return err;
   }
 
-  if (out_sqlda->sqld > out_sqlda->sqln)
+  struct IMessageMetadata *out_meta = IStatement_getOutputMetadata(tmp_stmt,
+                                                                    fbc->st);
+  unsigned nfields = IMessageMetadata_getCount(out_meta, fbc->st);
+
+  if (nfields > 0)
   {
-    int n = out_sqlda->sqld;
-    free(out_sqlda);
-    out_sqlda = fb_alloc_sqlda(n);
-    if (out_sqlda == NULL)
-      goto query_error;
-    isc_dsql_describe(status, &tmp_stmt, SQL_DIALECT_V6, out_sqlda);
-  }
-
-  if (out_sqlda->sqld > 0)
-    fb_allocate_output_buffers(out_sqlda);
-
-  if (isc_dsql_execute(status, &fbc->trans, &tmp_stmt, SQL_DIALECT_V6, NULL))
-  {
-    ISC_STATUS_ARRAY saved_status;
-    memcpy(saved_status, status, sizeof(ISC_STATUS_ARRAY));
-
-    fb_free_sqlda_buffers(out_sqlda);
-    free(out_sqlda);
-    ISC_STATUS_ARRAY cleanup_status;
-    isc_dsql_free_statement(cleanup_status, &tmp_stmt, DSQL_drop);
-    if (auto_txn)
+    unsigned out_len = IMessageMetadata_getMessageLength(out_meta, fbc->st);
+    unsigned char *out_buf = calloc(1, out_len);
+    if (out_buf == NULL)
     {
-      isc_rollback_transaction(cleanup_status, &fbc->trans);
-      fbc->trans = 0;
+      IMessageMetadata_release(out_meta);
+      IStatement_free(tmp_stmt, fbc->st);
+      rs->counter = SB_CNT_ERROR;
+      return DB_ERROR_FATAL;
     }
-    return fb_check_error(sb_conn, saved_status, "isc_dsql_execute", query,
-                          &rs->counter);
-  }
 
-  if (out_sqlda->sqld > 0)
-  {
     rs->counter = SB_CNT_READ;
 
-    uint32_t total_rows = 0;
-    fb_result_t *fbrs = fb_fetch_all_rows(out_sqlda, &tmp_stmt, status,
-                                           &total_rows);
-    if (fbrs == NULL)
-      goto query_error;
+    IStatus_init(fbc->st);
+    struct IResultSet *curs = IStatement_openCursor(tmp_stmt, fbc->st,
+        fbc->tra, NULL, NULL, out_meta, 0);
 
-    fbrs->stmt = tmp_stmt;
-    fbrs->out_sqlda = out_sqlda;
-    fbrs->owns_stmt = 1;
+    if (fb_check_status(fbc->st))
+    {
+      free(out_buf);
+      IMessageMetadata_release(out_meta);
+      IStatement_free(tmp_stmt, fbc->st);
+      if (auto_txn && fbc->tra)
+      {
+        struct IStatus *rst = IMaster_getStatus(fb_master);
+        ITransaction_rollback(fbc->tra, rst);
+        IStatus_dispose(rst);
+        fbc->tra = NULL;
+      }
+      return fb_handle_error(sb_conn, fbc, "openCursor", query, &rs->counter);
+    }
 
-    rs->nrows = total_rows;
-    rs->nfields = fbrs->nfields;
+    fb_result_t *fbrs = (fb_result_t *)calloc(1, sizeof(fb_result_t));
+    unsigned capacity = 64;
+    unsigned nrows = 0;
+    fbrs->nfields = nfields;
+    fbrs->values = (db_value_t *)calloc(capacity * nfields, sizeof(db_value_t));
+
+    while (IResultSet_fetchNext(curs, fbc->st, out_buf) == IStatus_RESULT_OK)
+    {
+      if (nrows >= capacity)
+      {
+        capacity *= 2;
+        db_value_t *nv = realloc(fbrs->values, capacity * nfields * sizeof(db_value_t));
+        if (nv == NULL) { fb_free_result(fbrs); free(out_buf); IResultSet_close(curs, fbc->st); IMessageMetadata_release(out_meta); IStatement_free(tmp_stmt, fbc->st); rs->counter = SB_CNT_ERROR; return DB_ERROR_FATAL; }
+        fbrs->values = nv;
+      }
+      for (unsigned ci = 0; ci < nfields; ci++)
+      {
+        uint32_t col_len = 0;
+        char *s = fb_extract_column_alloc(out_meta, fbc->st, out_buf, ci,
+                                           &col_len);
+        fbrs->values[nrows * nfields + ci].ptr = s;
+        fbrs->values[nrows * nfields + ci].len = col_len;
+        fb_result_add_string(fbrs, s);
+      }
+      nrows++;
+    }
+
+    fbrs->nrows = nrows;
+    rs->nrows = nrows;
+    rs->nfields = nfields;
     rs->ptr = fbrs;
 
-    isc_dsql_free_statement(status, &tmp_stmt, DSQL_close);
+    IResultSet_close(curs, fbc->st);
+    free(out_buf);
+    IMessageMetadata_release(out_meta);
+    IStatement_free(tmp_stmt, fbc->st);
 
     if (auto_txn)
     {
-      isc_commit_transaction(status, &fbc->trans);
-      fbc->trans = 0;
+      ITransaction_commit(fbc->tra, fbc->st);
+      fbc->tra = NULL;
     }
 
     return DB_ERROR_NONE;
   }
 
   /* DML or DDL */
+  IMessageMetadata_release(out_meta);
+
+  IStatus_init(fbc->st);
+  IStatement_execute(tmp_stmt, fbc->st, fbc->tra, NULL, NULL, NULL, NULL);
+
+  if (fb_check_status(fbc->st))
+  {
+    IStatement_free(tmp_stmt, fbc->st);
+    if (auto_txn && fbc->tra)
+    {
+      struct IStatus *rst = IMaster_getStatus(fb_master);
+      ITransaction_rollback(fbc->tra, rst);
+      IStatus_dispose(rst);
+      fbc->tra = NULL;
+    }
+    return fb_handle_error(sb_conn, fbc, "execute", query, &rs->counter);
+  }
+
+  IStatement_free(tmp_stmt, fbc->st);
+
   rs->counter = SB_CNT_WRITE;
   rs->nrows = 1;
   rs->ptr = NULL;
 
-  fb_free_sqlda_buffers(out_sqlda);
-  free(out_sqlda);
-  isc_dsql_free_statement(status, &tmp_stmt, DSQL_drop);
-
   if (auto_txn)
   {
-    isc_commit_transaction(status, &fbc->trans);
-    fbc->trans = 0;
+    ITransaction_commit(fbc->tra, fbc->st);
+    fbc->tra = NULL;
   }
 
   return DB_ERROR_NONE;
-
-query_error:
-  fb_free_sqlda_buffers(out_sqlda);
-  free(out_sqlda);
-  isc_dsql_free_statement(status, &tmp_stmt, DSQL_drop);
-  rs->counter = SB_CNT_ERROR;
-  return DB_ERROR_FATAL;
 }
 
 
@@ -1392,10 +1679,11 @@ int firebird_drv_fetch_row(db_result_t *rs, db_row_t *row)
   if (rownum >= (intptr_t)rs->nrows)
     return DB_ERROR_IGNORABLE;
 
-  if (rs->statement != NULL && rs->statement->emulated == 0)
+  if (rs->statement != NULL && rs->statement->emulated == 0 &&
+      rs->ptr == rs->statement->ptr)
   {
     fb_stmt_t *fbstmt = (fb_stmt_t *)rs->statement->ptr;
-    for (uint32_t i = 0; i < fbstmt->nfields; i++)
+    for (unsigned i = 0; i < fbstmt->nfields; i++)
     {
       row->values[i].len = fbstmt->cached_values[i].len;
       row->values[i].ptr = fbstmt->cached_values[i].ptr;
@@ -1405,7 +1693,7 @@ int firebird_drv_fetch_row(db_result_t *rs, db_row_t *row)
   {
     fb_result_t *fbrs = (fb_result_t *)rs->ptr;
     db_value_t *src = &fbrs->values[rownum * fbrs->nfields];
-    for (uint32_t i = 0; i < fbrs->nfields; i++)
+    for (unsigned i = 0; i < fbrs->nfields; i++)
     {
       row->values[i].len = src[i].len;
       row->values[i].ptr = src[i].ptr;
@@ -1413,7 +1701,6 @@ int firebird_drv_fetch_row(db_result_t *rs, db_row_t *row)
   }
 
   row->ptr = (void *)(rownum + 1);
-
   return DB_ERROR_NONE;
 }
 
@@ -1422,13 +1709,16 @@ int firebird_drv_free_results(db_result_t *rs)
 {
   if (rs->statement != NULL && rs->statement->emulated == 0)
   {
+    if (rs->ptr != NULL && rs->ptr != rs->statement->ptr)
+    {
+      fb_free_result((fb_result_t *)rs->ptr);
+    }
     rs->ptr = NULL;
     rs->row.ptr = 0;
     return 0;
   }
 
   fb_result_t *fbrs = (fb_result_t *)rs->ptr;
-
   if (fbrs != NULL)
   {
     fb_free_result(fbrs);
@@ -1442,46 +1732,44 @@ int firebird_drv_free_results(db_result_t *rs)
 
 int firebird_drv_close(db_stmt_t *stmt)
 {
-  ISC_STATUS_ARRAY status;
+  fb_conn_t *fbc = (fb_conn_t *)stmt->connection->ptr;
   fb_stmt_t *fbstmt = (fb_stmt_t *)stmt->ptr;
 
   if (fbstmt == NULL)
     return 1;
 
-  if (fbstmt->in_sqlda != NULL)
+  if (fbstmt->cursor_open && fbstmt->cursor)
   {
-    for (int i = 0; i < fbstmt->nparams; i++)
-    {
-      xfree(fbstmt->in_sqlda->sqlvar[i].sqldata);
-      xfree(fbstmt->in_sqlda->sqlvar[i].sqlind);
-    }
-    free(fbstmt->in_sqlda);
+    IResultSet_close(fbstmt->cursor, fbc->st);
+    fbstmt->cursor = NULL;
+    fbstmt->cursor_open = 0;
   }
 
   if (fbstmt->conv_bufs != NULL)
   {
-    for (uint32_t i = 0; i < fbstmt->nfields; i++)
+    for (unsigned i = 0; i < fbstmt->nfields; i++)
       free(fbstmt->conv_bufs[i]);
     free(fbstmt->conv_bufs);
   }
   free(fbstmt->cached_values);
+  free(fbstmt->out_buf);
+  free(fbstmt->in_buf);
 
-  if (fbstmt->out_sqlda != NULL)
-  {
-    fb_free_sqlda_buffers(fbstmt->out_sqlda);
-    free(fbstmt->out_sqlda);
-  }
-
-  if (fbstmt->stmt != 0)
-    isc_dsql_free_statement(status, &fbstmt->stmt, DSQL_drop);
+  if (fbstmt->out_meta) IMessageMetadata_release(fbstmt->out_meta);
+  if (fbstmt->in_meta) IMessageMetadata_release(fbstmt->in_meta);
+  if (fbstmt->stmt) IStatement_free(fbstmt->stmt, fbc->st);
 
   xfree(stmt->ptr);
-
   return 0;
 }
 
 
 int firebird_drv_done(void)
 {
+  if (fb_prov)
+  {
+    IProvider_release(fb_prov);
+    fb_prov = NULL;
+  }
   return 0;
 }

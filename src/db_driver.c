@@ -52,8 +52,6 @@ static sb_list_t        drivers;          /* list of available DB drivers */
 
 static uint8_t stats_enabled;
 
-static int bulk_single_row;
-
 static bool db_global_initialized;
 static pthread_once_t db_global_once = PTHREAD_ONCE_INIT;
 
@@ -967,7 +965,7 @@ int db_bulk_insert_init(db_conn_t *con, const char *query, size_t query_len)
   con->bulk_ptr = query_len;
   con->bulk_values = query_len;
   con->bulk_cnt = 0;
-  bulk_single_row = !driver_caps.multi_rows_insert;
+  con->bulk_single_row = !driver_caps.multi_rows_insert;
 
   return 0;
 }
@@ -1024,7 +1022,7 @@ int db_bulk_insert_next(db_conn_t *con, const char *query, size_t query_len)
 
   con->bulk_cnt++;
 
-  if (bulk_single_row)
+  if (con->bulk_single_row)
   {
     if (db_bulk_do_insert(con, 0))
       return 1;

@@ -222,8 +222,7 @@ SQL Lua API + Firebird tests
   > end
   > EOF
   $ sysbench $SB_ARGS --firebird-db="non-existing:/tmp/noexist.fdb" run
-  FATAL: isc_attach_database() failed:
-  FATAL: * (glob)
-  FATAL: * (glob)
-  FATAL: * (glob)
+  FATAL: attachDatabase() failed: * (glob)
+  .* (re)
+  .* (re)
   connection creation failed
