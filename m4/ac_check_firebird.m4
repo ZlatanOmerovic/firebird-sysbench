@@ -48,7 +48,7 @@ fi
 if test [ -n "$ac_cv_firebird_libs" ]
 then
     AC_CACHE_CHECK([Firebird libraries], [ac_cv_firebird_libs], [ac_cv_firebird_libs=""])
-    FIREBIRD_LIBS="-L$ac_cv_firebird_libs -lfbclient"
+    FIREBIRD_LIBS="-ldl"
 fi
 
 # If some path is missing, try to autodetermine with fb_config
@@ -80,7 +80,7 @@ ERROR: cannot find Firebird libraries. If you want to compile with Firebird
         if test [ -z "$ac_cv_firebird_libs" ]
         then
             AC_MSG_CHECKING(Firebird linker flags)
-            FIREBIRD_LIBS=`${fbconfig} --libs`
+            FIREBIRD_LIBS="-ldl"
             AC_MSG_RESULT($FIREBIRD_LIBS)
         fi
     fi

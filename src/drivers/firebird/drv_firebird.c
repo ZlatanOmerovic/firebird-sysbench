@@ -29,6 +29,8 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <inttypes.h>
+#include <pthread.h>
+#include <dlfcn.h>
 
 #include "firebird/fb_c_api.h"
 
@@ -46,6 +48,9 @@ static sb_arg_t firebird_drv_args[] =
          "localhost:/tmp/sbtest.fdb", STRING),
   SB_OPT("firebird-user", "Firebird user", "SYSDBA", STRING),
   SB_OPT("firebird-password", "Firebird password", "masterkey", STRING),
+  SB_OPT("firebird-client",
+         "Path to libfbclient.so to load at runtime (overrides default)",
+         "libfbclient.so", STRING),
 
   SB_OPT_END
 };
@@ -55,12 +60,20 @@ typedef struct
   const char *db;
   const char *user;
   const char *password;
+  const char *client;
 } fb_drv_args_t;
 
 /* Per-process globals — initialized once in drv_init */
 static struct IMaster *fb_master;
 static struct IProvider *fb_prov;
 static struct IUtil *fb_utl;
+
+/* libfbclient.so handles resolved at runtime via dlopen/dlsym. */
+static void *fb_dlhandle;
+typedef struct IMaster *(*fb_get_master_t)(void);
+typedef ISC_LONG (*isc_sqlcode_t)(const ISC_STATUS *);
+static fb_get_master_t p_fb_get_master_interface;
+static isc_sqlcode_t   p_isc_sqlcode;
 
 #define BATCH_FLUSH_SIZE 1000
 
@@ -77,6 +90,7 @@ typedef struct
   unsigned batch_count;
   char *batch_base_sql;
   int batch_auto_txn;
+  char in_explicit_txn;  /* 1 if user sent BEGIN; clear on COMMIT/ROLLBACK */
 } fb_conn_t;
 
 typedef struct
@@ -119,6 +133,9 @@ static drv_caps_t firebird_drv_caps =
 
 static fb_drv_args_t args;
 static char use_ps;
+/* Set when the runtime libfbclient is older than FB4 — IStatement::createBatch
+ * is absent from its vtable, so dispatching through that slot would crash. */
+static char fb_no_batch;
 
 static int firebird_drv_init(void);
 static int firebird_drv_describe(drv_caps_t *);
@@ -186,7 +203,7 @@ static db_error_t fb_handle_error(db_conn_t *con, fb_conn_t *fbc,
   char msg[512];
   IUtil_formatStatus(fb_utl, msg, sizeof(msg), fbc->st);
 
-  long sqlcode = isc_sqlcode(IStatus_getErrors(fbc->st));
+  long sqlcode = p_isc_sqlcode(IStatus_getErrors(fbc->st));
 
   char sqlstate_buf[16];
   snprintf(sqlstate_buf, sizeof(sqlstate_buf), "%05ld",
@@ -217,6 +234,25 @@ static db_error_t fb_handle_error(db_conn_t *con, fb_conn_t *fbc,
 
   *counter = SB_CNT_ERROR;
   return DB_ERROR_FATAL;
+}
+
+/* Commit the implicit transaction after a successful statement when the
+ * caller has not opened an explicit one with BEGIN. Matches MySQL/PgSQL
+ * autocommit semantics so per-row cost (including fsync) is comparable. */
+static int fb_autocommit_if_implicit(fb_conn_t *fbc)
+{
+  if (fbc->in_explicit_txn || fbc->tra == NULL)
+    return 0;
+
+  IStatus_init(fbc->st);
+  ITransaction_commit(fbc->tra, fbc->st);
+  fbc->tra = NULL;
+  if (fb_check_status(fbc->st))
+  {
+    fb_log_error("autocommit", fbc->st);
+    return 1;
+  }
+  return 0;
 }
 
 static int fb_ensure_transaction(fb_conn_t *fbc)
@@ -498,6 +534,9 @@ static int fb_batch_create(fb_conn_t *fbc, const char *base_sql,
   char params[256];
   char *p = params;
 
+  if (fb_no_batch)
+    return -1;  /* runtime libfbclient is too old for IStatement::createBatch */
+
   if (ncols > 120)
     return 1;
 
@@ -697,10 +736,89 @@ int firebird_drv_init(void)
   args.db = sb_get_value_string("firebird-db");
   args.user = sb_get_value_string("firebird-user");
   args.password = sb_get_value_string("firebird-password");
+  args.client = sb_get_value_string("firebird-client");
 
-  fb_master = fb_get_master_interface();
+  fb_dlhandle = dlopen(args.client, RTLD_NOW | RTLD_GLOBAL);
+  if (fb_dlhandle == NULL)
+  {
+    log_text(LOG_FATAL, "dlopen('%s') failed: %s", args.client, dlerror());
+    log_text(LOG_FATAL,
+             "set --firebird-client=PATH or LD_LIBRARY_PATH to the directory "
+             "containing libfbclient.so");
+    return 1;
+  }
+
+  p_fb_get_master_interface =
+      (fb_get_master_t)dlsym(fb_dlhandle, "fb_get_master_interface");
+  p_isc_sqlcode = (isc_sqlcode_t)dlsym(fb_dlhandle, "isc_sqlcode");
+  if (p_fb_get_master_interface == NULL || p_isc_sqlcode == NULL)
+  {
+    log_text(LOG_FATAL,
+             "dlsym failed in '%s': %s — is this really libfbclient?",
+             args.client, dlerror());
+    return 1;
+  }
+
+  fb_master = p_fb_get_master_interface();
   fb_prov = IMaster_getDispatcher(fb_master);
   fb_utl = IMaster_getUtilInterface(fb_master);
+
+  /* Runtime IUtil vtable version. The cloop ABI guarantees vtable->version
+   * sits at a fixed offset that's safe to read without dispatch. The C API
+   * wrapper (fb_c_api.h) was introduced in Firebird 5; FB3 and earlier
+   * ship only C++ interface headers and use an older vtable layout. Many
+   * methods we dispatch through (createBatch, immediate-execute forms,
+   * etc.) sit at offsets that don't exist in those older vtables and would
+   * crash. */
+  {
+    uintptr_t util_vt_version =
+        ((uintptr_t *)((void **)fb_utl->vtable))[1];
+    if (util_vt_version < 3)
+    {
+      log_text(LOG_FATAL,
+               "Firebird client library is too old for this driver "
+               "(IUtil vtable v%u). The OO API driver requires libfbclient "
+               "from Firebird 4.0 or newer.",
+               (unsigned)util_vt_version);
+      log_text(LOG_FATAL,
+               "For Firebird 3 support, use the `firebird-isc` branch which "
+               "uses the legacy ISC API.");
+      return 1;
+    }
+    if (util_vt_version < 4)
+    {
+      fb_no_batch = 1;
+      log_text(LOG_NOTICE,
+               "Firebird client lib pre-4.0 (IUtil vtable v%u) — "
+               "Batch API disabled; bulk inserts fall back to single-row.",
+               (unsigned)util_vt_version);
+    }
+  }
+
+  /* Detect embedded mode: a connection string with no "<host>[/<port>]:"
+   * prefix makes libfbclient load the embedded engine in-process. The
+   * embedded engine builds a deep object hierarchy on the worker-thread
+   * stack during attachDatabase and segfaults with sysbench's default 64K
+   * thread stack. Networked syntax is `host:path` or `host/port:path`. */
+  {
+    int is_embedded = (args.db[0] == '/' || args.db[0] == '.'
+                       || strchr(args.db, ':') == NULL);
+    if (is_embedded)
+    {
+      size_t stack_size = sb_get_value_size("thread-stack-size");
+      if (stack_size < 2 * 1024 * 1024)
+      {
+        log_text(LOG_WARNING,
+                 "Firebird embedded mode detected ('%s' has no host: prefix).",
+                 args.db);
+        log_text(LOG_WARNING,
+                 "The embedded engine needs more stack than sysbench's default "
+                 "64K — run with --thread-stack-size=2M or larger, otherwise "
+                 "worker threads will segfault inside libEngine*.so during "
+                 "attachDatabase.");
+      }
+    }
+  }
 
   use_ps = 0;
   firebird_drv_caps.prepared_statements = 1;
@@ -1242,6 +1360,9 @@ db_error_t firebird_drv_execute(db_stmt_t *stmt, db_result_t *rs)
     if (fb_check_status(fbc->st))
       return fb_handle_error(con, fbc, "execute", stmt->query, &rs->counter);
 
+    if (fb_autocommit_if_implicit(fbc))
+      return DB_ERROR_FATAL;
+
     rs->counter = SB_CNT_WRITE;
     rs->nrows = 1;
     return DB_ERROR_NONE;
@@ -1296,64 +1417,57 @@ db_error_t firebird_drv_query(db_conn_t *sb_conn, const char *query, size_t len,
   xfree(sb_conn->sql_state);
   xfree(sb_conn->sql_errmsg);
 
-  /* Intercept transaction control */
-  if (strcasecmp(query, "BEGIN") == 0)
+  /* Transaction control intercept.
+   * Firebird accepts COMMIT and ROLLBACK as plain SQL, but we capture them
+   * here to (a) flush any pending IBatch before commit and (b) reset our
+   * fbc->tra pointer after the OO API ITransaction handle is consumed.
+   * BEGIN is sysbench-specific; the Firebird equivalent is SET TRANSACTION,
+   * but since we have ITransaction_startTransaction at hand it's simpler to
+   * call it directly than to round-trip through SQL.
+   */
+  int is_commit = (strcasecmp(query, "COMMIT") == 0);
+  int is_rollback = (strcasecmp(query, "ROLLBACK") == 0);
+
+  if (is_commit || is_rollback || strcasecmp(query, "BEGIN") == 0)
   {
+    if (is_commit)
+      fb_batch_close(fbc);
+
     if (fbc->tra != NULL)
     {
       IStatus_init(fbc->st);
-      ITransaction_commit(fbc->tra, fbc->st);
+      if (is_rollback)
+        ITransaction_rollback(fbc->tra, fbc->st);
+      else
+        ITransaction_commit(fbc->tra, fbc->st);
       fbc->tra = NULL;
-      if (fb_check_status(fbc->st))
+      if (!is_rollback && fb_check_status(fbc->st))
       {
-        fb_log_error("commit(implicit in BEGIN)", fbc->st);
+        fb_log_error(is_commit ? "commit" : "commit(implicit in BEGIN)",
+                     fbc->st);
         rs->counter = SB_CNT_ERROR;
         return DB_ERROR_FATAL;
       }
     }
-    IStatus_init(fbc->st);
-    fbc->tra = IAttachment_startTransaction(fbc->att, fbc->st, 0, NULL);
-    if (fb_check_status(fbc->st))
-    {
-      fb_log_error("startTransaction", fbc->st);
-      fbc->tra = NULL;
-      rs->counter = SB_CNT_ERROR;
-      return DB_ERROR_FATAL;
-    }
-    rs->counter = SB_CNT_OTHER;
-    rs->nrows = 0;
-    return DB_ERROR_NONE;
-  }
 
-  if (strcasecmp(query, "COMMIT") == 0)
-  {
-    fb_batch_close(fbc);
-
-    if (fbc->tra != NULL)
+    if (!is_commit && !is_rollback)
     {
       IStatus_init(fbc->st);
-      ITransaction_commit(fbc->tra, fbc->st);
+      fbc->tra = IAttachment_startTransaction(fbc->att, fbc->st, 0, NULL);
       if (fb_check_status(fbc->st))
       {
-        fb_log_error("commit", fbc->st);
+        fb_log_error("startTransaction", fbc->st);
         fbc->tra = NULL;
         rs->counter = SB_CNT_ERROR;
         return DB_ERROR_FATAL;
       }
-      fbc->tra = NULL;
+      fbc->in_explicit_txn = 1;
     }
-    rs->counter = SB_CNT_OTHER;
-    rs->nrows = 0;
-    return DB_ERROR_NONE;
-  }
-
-  if (strcasecmp(query, "ROLLBACK") == 0)
-  {
-    if (fbc->tra != NULL)
+    else
     {
-      ITransaction_rollback(fbc->tra, fbc->st);
-      fbc->tra = NULL;
+      fbc->in_explicit_txn = 0;
     }
+
     rs->counter = SB_CNT_OTHER;
     rs->nrows = 0;
     return DB_ERROR_NONE;
@@ -1382,7 +1496,7 @@ db_error_t firebird_drv_query(db_conn_t *sb_conn, const char *query, size_t len,
 
       if (fb_check_status(fbc->st))
       {
-        long sqlcode = isc_sqlcode(IStatus_getErrors(fbc->st));
+        long sqlcode = p_isc_sqlcode(IStatus_getErrors(fbc->st));
         if (sqlcode == -607)
         {
           if (auto_txn)
@@ -1428,7 +1542,7 @@ db_error_t firebird_drv_query(db_conn_t *sb_conn, const char *query, size_t len,
 
     if (fb_check_status(fbc->st))
     {
-      long sqlcode = isc_sqlcode(IStatus_getErrors(fbc->st));
+      long sqlcode = p_isc_sqlcode(IStatus_getErrors(fbc->st));
       if (sqlcode == -607)
       {
         if (auto_txn)
@@ -1770,6 +1884,11 @@ int firebird_drv_done(void)
   {
     IProvider_release(fb_prov);
     fb_prov = NULL;
+  }
+  if (fb_dlhandle)
+  {
+    dlclose(fb_dlhandle);
+    fb_dlhandle = NULL;
   }
   return 0;
 }
