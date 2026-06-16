@@ -29,6 +29,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <inttypes.h>
+#include <pthread.h>
 #include <dlfcn.h>
 
 #include "firebird/fb_c_api.h"
@@ -755,6 +756,32 @@ int firebird_drv_init(void)
   fb_master = p_fb_get_master_interface();
   fb_prov = IMaster_getDispatcher(fb_master);
   fb_utl = IMaster_getUtilInterface(fb_master);
+
+  /* Detect embedded mode: a connection string with no "<host>:" prefix
+   * makes libfbclient load the embedded engine in-process. The embedded
+   * engine builds a deep object hierarchy on the worker-thread stack
+   * during attachDatabase and segfaults with sysbench's default 64K
+   * thread stack. */
+  {
+    const char *colon = strchr(args.db, ':');
+    const char *slash = strchr(args.db, '/');
+    int is_embedded = (colon == NULL) || (slash != NULL && slash < colon);
+    if (is_embedded)
+    {
+      size_t stack_size = sb_get_value_size("thread-stack-size");
+      if (stack_size < 2 * 1024 * 1024)
+      {
+        log_text(LOG_WARNING,
+                 "Firebird embedded mode detected ('%s' has no host: prefix).",
+                 args.db);
+        log_text(LOG_WARNING,
+                 "The embedded engine needs more stack than sysbench's default "
+                 "64K — run with --thread-stack-size=2M or larger, otherwise "
+                 "worker threads will segfault inside libEngine*.so during "
+                 "attachDatabase.");
+      }
+    }
+  }
 
   use_ps = 0;
   firebird_drv_caps.prepared_statements = 1;
