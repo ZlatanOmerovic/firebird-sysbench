@@ -133,6 +133,9 @@ static drv_caps_t firebird_drv_caps =
 
 static fb_drv_args_t args;
 static char use_ps;
+/* Set when the runtime libfbclient is older than FB4 — IStatement::createBatch
+ * is absent from its vtable, so dispatching through that slot would crash. */
+static char fb_no_batch;
 
 static int firebird_drv_init(void);
 static int firebird_drv_describe(drv_caps_t *);
@@ -531,6 +534,9 @@ static int fb_batch_create(fb_conn_t *fbc, const char *base_sql,
   char params[256];
   char *p = params;
 
+  if (fb_no_batch)
+    return -1;  /* runtime libfbclient is too old for IStatement::createBatch */
+
   if (ncols > 120)
     return 1;
 
@@ -757,15 +763,46 @@ int firebird_drv_init(void)
   fb_prov = IMaster_getDispatcher(fb_master);
   fb_utl = IMaster_getUtilInterface(fb_master);
 
-  /* Detect embedded mode: a connection string with no "<host>:" prefix
-   * makes libfbclient load the embedded engine in-process. The embedded
-   * engine builds a deep object hierarchy on the worker-thread stack
-   * during attachDatabase and segfaults with sysbench's default 64K
-   * thread stack. */
+  /* Runtime IUtil vtable version. The cloop ABI guarantees vtable->version
+   * sits at a fixed offset that's safe to read without dispatch. The C API
+   * wrapper (fb_c_api.h) was introduced in Firebird 5; FB3 and earlier
+   * ship only C++ interface headers and use an older vtable layout. Many
+   * methods we dispatch through (createBatch, immediate-execute forms,
+   * etc.) sit at offsets that don't exist in those older vtables and would
+   * crash. */
   {
-    const char *colon = strchr(args.db, ':');
-    const char *slash = strchr(args.db, '/');
-    int is_embedded = (colon == NULL) || (slash != NULL && slash < colon);
+    uintptr_t util_vt_version =
+        ((uintptr_t *)((void **)fb_utl->vtable))[1];
+    if (util_vt_version < 3)
+    {
+      log_text(LOG_FATAL,
+               "Firebird client library is too old for this driver "
+               "(IUtil vtable v%u). The OO API driver requires libfbclient "
+               "from Firebird 4.0 or newer.",
+               (unsigned)util_vt_version);
+      log_text(LOG_FATAL,
+               "For Firebird 3 support, use the `firebird-isc` branch which "
+               "uses the legacy ISC API.");
+      return 1;
+    }
+    if (util_vt_version < 4)
+    {
+      fb_no_batch = 1;
+      log_text(LOG_NOTICE,
+               "Firebird client lib pre-4.0 (IUtil vtable v%u) — "
+               "Batch API disabled; bulk inserts fall back to single-row.",
+               (unsigned)util_vt_version);
+    }
+  }
+
+  /* Detect embedded mode: a connection string with no "<host>[/<port>]:"
+   * prefix makes libfbclient load the embedded engine in-process. The
+   * embedded engine builds a deep object hierarchy on the worker-thread
+   * stack during attachDatabase and segfaults with sysbench's default 64K
+   * thread stack. Networked syntax is `host:path` or `host/port:path`. */
+  {
+    int is_embedded = (args.db[0] == '/' || args.db[0] == '.'
+                       || strchr(args.db, ':') == NULL);
     if (is_embedded)
     {
       size_t stack_size = sb_get_value_size("thread-stack-size");
