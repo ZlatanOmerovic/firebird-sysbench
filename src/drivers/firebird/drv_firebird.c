@@ -77,6 +77,7 @@ typedef struct
   unsigned batch_count;
   char *batch_base_sql;
   int batch_auto_txn;
+  char in_explicit_txn;  /* 1 if user sent BEGIN; clear on COMMIT/ROLLBACK */
 } fb_conn_t;
 
 typedef struct
@@ -217,6 +218,25 @@ static db_error_t fb_handle_error(db_conn_t *con, fb_conn_t *fbc,
 
   *counter = SB_CNT_ERROR;
   return DB_ERROR_FATAL;
+}
+
+/* Commit the implicit transaction after a successful statement when the
+ * caller has not opened an explicit one with BEGIN. Matches MySQL/PgSQL
+ * autocommit semantics so per-row cost (including fsync) is comparable. */
+static int fb_autocommit_if_implicit(fb_conn_t *fbc)
+{
+  if (fbc->in_explicit_txn || fbc->tra == NULL)
+    return 0;
+
+  IStatus_init(fbc->st);
+  ITransaction_commit(fbc->tra, fbc->st);
+  fbc->tra = NULL;
+  if (fb_check_status(fbc->st))
+  {
+    fb_log_error("autocommit", fbc->st);
+    return 1;
+  }
+  return 0;
 }
 
 static int fb_ensure_transaction(fb_conn_t *fbc)
@@ -1242,6 +1262,9 @@ db_error_t firebird_drv_execute(db_stmt_t *stmt, db_result_t *rs)
     if (fb_check_status(fbc->st))
       return fb_handle_error(con, fbc, "execute", stmt->query, &rs->counter);
 
+    if (fb_autocommit_if_implicit(fbc))
+      return DB_ERROR_FATAL;
+
     rs->counter = SB_CNT_WRITE;
     rs->nrows = 1;
     return DB_ERROR_NONE;
@@ -1340,6 +1363,11 @@ db_error_t firebird_drv_query(db_conn_t *sb_conn, const char *query, size_t len,
         rs->counter = SB_CNT_ERROR;
         return DB_ERROR_FATAL;
       }
+      fbc->in_explicit_txn = 1;
+    }
+    else
+    {
+      fbc->in_explicit_txn = 0;
     }
 
     rs->counter = SB_CNT_OTHER;
