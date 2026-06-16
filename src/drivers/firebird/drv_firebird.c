@@ -29,6 +29,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <inttypes.h>
+#include <dlfcn.h>
 
 #include "firebird/fb_c_api.h"
 
@@ -46,6 +47,9 @@ static sb_arg_t firebird_drv_args[] =
          "localhost:/tmp/sbtest.fdb", STRING),
   SB_OPT("firebird-user", "Firebird user", "SYSDBA", STRING),
   SB_OPT("firebird-password", "Firebird password", "masterkey", STRING),
+  SB_OPT("firebird-client",
+         "Path to libfbclient.so to load at runtime (overrides default)",
+         "libfbclient.so", STRING),
 
   SB_OPT_END
 };
@@ -55,12 +59,20 @@ typedef struct
   const char *db;
   const char *user;
   const char *password;
+  const char *client;
 } fb_drv_args_t;
 
 /* Per-process globals — initialized once in drv_init */
 static struct IMaster *fb_master;
 static struct IProvider *fb_prov;
 static struct IUtil *fb_utl;
+
+/* libfbclient.so handles resolved at runtime via dlopen/dlsym. */
+static void *fb_dlhandle;
+typedef struct IMaster *(*fb_get_master_t)(void);
+typedef ISC_LONG (*isc_sqlcode_t)(const ISC_STATUS *);
+static fb_get_master_t p_fb_get_master_interface;
+static isc_sqlcode_t   p_isc_sqlcode;
 
 #define BATCH_FLUSH_SIZE 1000
 
@@ -187,7 +199,7 @@ static db_error_t fb_handle_error(db_conn_t *con, fb_conn_t *fbc,
   char msg[512];
   IUtil_formatStatus(fb_utl, msg, sizeof(msg), fbc->st);
 
-  long sqlcode = isc_sqlcode(IStatus_getErrors(fbc->st));
+  long sqlcode = p_isc_sqlcode(IStatus_getErrors(fbc->st));
 
   char sqlstate_buf[16];
   snprintf(sqlstate_buf, sizeof(sqlstate_buf), "%05ld",
@@ -717,8 +729,30 @@ int firebird_drv_init(void)
   args.db = sb_get_value_string("firebird-db");
   args.user = sb_get_value_string("firebird-user");
   args.password = sb_get_value_string("firebird-password");
+  args.client = sb_get_value_string("firebird-client");
 
-  fb_master = fb_get_master_interface();
+  fb_dlhandle = dlopen(args.client, RTLD_NOW | RTLD_GLOBAL);
+  if (fb_dlhandle == NULL)
+  {
+    log_text(LOG_FATAL, "dlopen('%s') failed: %s", args.client, dlerror());
+    log_text(LOG_FATAL,
+             "set --firebird-client=PATH or LD_LIBRARY_PATH to the directory "
+             "containing libfbclient.so");
+    return 1;
+  }
+
+  p_fb_get_master_interface =
+      (fb_get_master_t)dlsym(fb_dlhandle, "fb_get_master_interface");
+  p_isc_sqlcode = (isc_sqlcode_t)dlsym(fb_dlhandle, "isc_sqlcode");
+  if (p_fb_get_master_interface == NULL || p_isc_sqlcode == NULL)
+  {
+    log_text(LOG_FATAL,
+             "dlsym failed in '%s': %s — is this really libfbclient?",
+             args.client, dlerror());
+    return 1;
+  }
+
+  fb_master = p_fb_get_master_interface();
   fb_prov = IMaster_getDispatcher(fb_master);
   fb_utl = IMaster_getUtilInterface(fb_master);
 
@@ -1398,7 +1432,7 @@ db_error_t firebird_drv_query(db_conn_t *sb_conn, const char *query, size_t len,
 
       if (fb_check_status(fbc->st))
       {
-        long sqlcode = isc_sqlcode(IStatus_getErrors(fbc->st));
+        long sqlcode = p_isc_sqlcode(IStatus_getErrors(fbc->st));
         if (sqlcode == -607)
         {
           if (auto_txn)
@@ -1444,7 +1478,7 @@ db_error_t firebird_drv_query(db_conn_t *sb_conn, const char *query, size_t len,
 
     if (fb_check_status(fbc->st))
     {
-      long sqlcode = isc_sqlcode(IStatus_getErrors(fbc->st));
+      long sqlcode = p_isc_sqlcode(IStatus_getErrors(fbc->st));
       if (sqlcode == -607)
       {
         if (auto_txn)
@@ -1786,6 +1820,11 @@ int firebird_drv_done(void)
   {
     IProvider_release(fb_prov);
     fb_prov = NULL;
+  }
+  if (fb_dlhandle)
+  {
+    dlclose(fb_dlhandle);
+    fb_dlhandle = NULL;
   }
   return 0;
 }
