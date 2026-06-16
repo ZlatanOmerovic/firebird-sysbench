@@ -1296,64 +1296,52 @@ db_error_t firebird_drv_query(db_conn_t *sb_conn, const char *query, size_t len,
   xfree(sb_conn->sql_state);
   xfree(sb_conn->sql_errmsg);
 
-  /* Intercept transaction control */
-  if (strcasecmp(query, "BEGIN") == 0)
+  /* Transaction control intercept.
+   * Firebird accepts COMMIT and ROLLBACK as plain SQL, but we capture them
+   * here to (a) flush any pending IBatch before commit and (b) reset our
+   * fbc->tra pointer after the OO API ITransaction handle is consumed.
+   * BEGIN is sysbench-specific; the Firebird equivalent is SET TRANSACTION,
+   * but since we have ITransaction_startTransaction at hand it's simpler to
+   * call it directly than to round-trip through SQL.
+   */
+  int is_commit = (strcasecmp(query, "COMMIT") == 0);
+  int is_rollback = (strcasecmp(query, "ROLLBACK") == 0);
+
+  if (is_commit || is_rollback || strcasecmp(query, "BEGIN") == 0)
   {
+    if (is_commit)
+      fb_batch_close(fbc);
+
     if (fbc->tra != NULL)
     {
       IStatus_init(fbc->st);
-      ITransaction_commit(fbc->tra, fbc->st);
+      if (is_rollback)
+        ITransaction_rollback(fbc->tra, fbc->st);
+      else
+        ITransaction_commit(fbc->tra, fbc->st);
       fbc->tra = NULL;
-      if (fb_check_status(fbc->st))
+      if (!is_rollback && fb_check_status(fbc->st))
       {
-        fb_log_error("commit(implicit in BEGIN)", fbc->st);
+        fb_log_error(is_commit ? "commit" : "commit(implicit in BEGIN)",
+                     fbc->st);
         rs->counter = SB_CNT_ERROR;
         return DB_ERROR_FATAL;
       }
     }
-    IStatus_init(fbc->st);
-    fbc->tra = IAttachment_startTransaction(fbc->att, fbc->st, 0, NULL);
-    if (fb_check_status(fbc->st))
-    {
-      fb_log_error("startTransaction", fbc->st);
-      fbc->tra = NULL;
-      rs->counter = SB_CNT_ERROR;
-      return DB_ERROR_FATAL;
-    }
-    rs->counter = SB_CNT_OTHER;
-    rs->nrows = 0;
-    return DB_ERROR_NONE;
-  }
 
-  if (strcasecmp(query, "COMMIT") == 0)
-  {
-    fb_batch_close(fbc);
-
-    if (fbc->tra != NULL)
+    if (!is_commit && !is_rollback)
     {
       IStatus_init(fbc->st);
-      ITransaction_commit(fbc->tra, fbc->st);
+      fbc->tra = IAttachment_startTransaction(fbc->att, fbc->st, 0, NULL);
       if (fb_check_status(fbc->st))
       {
-        fb_log_error("commit", fbc->st);
+        fb_log_error("startTransaction", fbc->st);
         fbc->tra = NULL;
         rs->counter = SB_CNT_ERROR;
         return DB_ERROR_FATAL;
       }
-      fbc->tra = NULL;
     }
-    rs->counter = SB_CNT_OTHER;
-    rs->nrows = 0;
-    return DB_ERROR_NONE;
-  }
 
-  if (strcasecmp(query, "ROLLBACK") == 0)
-  {
-    if (fbc->tra != NULL)
-    {
-      ITransaction_rollback(fbc->tra, fbc->st);
-      fbc->tra = NULL;
-    }
     rs->counter = SB_CNT_OTHER;
     rs->nrows = 0;
     return DB_ERROR_NONE;
