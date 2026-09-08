@@ -12,13 +12,16 @@ root. Directories are named after the date in the filenames.
 
 ## Two caveats before quoting anything here
 
-**The headers do not record which server was measured.** A run's header has
+**The headers of the runs archived here do not record which server was
+measured.** A run's header has
 the driver name, table count, table size, thread count, duration and a
 timestamp — but not the connection string, port, `libfbclient` path or
 buffer-cache setting. Nothing inside a `benchmark_firebird_*.txt` file
 distinguishes a Firebird 4, 5 or 6 run. The attribution table below was
 reconstructed by matching `oltp_point_select` throughput against the
-published tables.
+published tables. Runs from 2026-09-08 onward record the connection string
+(password redacted) and the resolved `libfbclient` path in the header, so
+this reconstruction is only needed for the files already here.
 
 **Every file here is a `4 tables x 10,000 rows` run.** The 1M-row scaling
 tables in `BENCHMARK_RESULTS.md`,

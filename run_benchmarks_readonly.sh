@@ -24,6 +24,19 @@ case "$DB_DRIVER" in
     ;;
 esac
 
+# Firebird: let the caller pick the client library, and remember which one
+# will actually be loaded. The driver dlopens "libfbclient.so" through the
+# ldconfig cache by default, so the version measured depends on the loader.
+if [ "$DB_DRIVER" = firebird ]; then
+  if [ -n "${FIREBIRD_CLIENT:-}" ]; then
+    DB_ARGS="$DB_ARGS --firebird-client=$FIREBIRD_CLIENT"
+    FB_CLIENT="$FIREBIRD_CLIENT"
+  else
+    FB_CLIENT=$(ldconfig -p 2>/dev/null | awk '/libfbclient\.so \(/{print $NF; exit}')
+    FB_CLIENT="${FB_CLIENT:-libfbclient.so (not in ldconfig cache)}"
+  fi
+fi
+
 TABLES="${TABLES:-4}"
 TABLE_SIZE="${TABLE_SIZE:-10000}"
 THREADS="${THREADS:-4}"
@@ -37,6 +50,10 @@ RESULTS_FILE="benchmark_safe_${DB_DRIVER}_$(date +%Y%m%d_%H%M%S).txt"
 echo "========================================" | tee "$RESULTS_FILE"
 echo "Sysbench Read/Safe Benchmark Suite" | tee -a "$RESULTS_FILE"
 echo "Driver: $DB_DRIVER" | tee -a "$RESULTS_FILE"
+echo "Connection: $(echo "$DB_ARGS" | sed -E 's/(-password=)[^ ]*/\1***/g')" | tee -a "$RESULTS_FILE"
+if [ "$DB_DRIVER" = firebird ]; then
+  echo "Client library: $FB_CLIENT" | tee -a "$RESULTS_FILE"
+fi
 echo "Tables: $TABLES x $TABLE_SIZE rows" | tee -a "$RESULTS_FILE"
 echo "Threads: $THREADS, Time: ${TIME}s" | tee -a "$RESULTS_FILE"
 echo "Script start: $(date)" | tee -a "$RESULTS_FILE"
