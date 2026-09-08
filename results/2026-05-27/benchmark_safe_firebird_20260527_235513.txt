@@ -1,0 +1,235 @@
+========================================
+Sysbench Read/Safe Benchmark Suite
+Driver: firebird
+Tables: 4 x 10000 rows
+Threads: 4, Time: 10s
+Script start: Wed May 27 11:55:13 PM CEST 2026
+========================================
+Preparing tables...
+sysbench 1.1.0-3ceba0b (using bundled LuaJIT 2.1.0-beta3)
+
+Creating table 'sbtest1'...
+Inserting 10000 records into 'sbtest1'
+Creating a secondary index on 'sbtest1'...
+Creating table 'sbtest2'...
+Inserting 10000 records into 'sbtest2'
+Creating a secondary index on 'sbtest2'...
+Creating table 'sbtest3'...
+Inserting 10000 records into 'sbtest3'
+Creating a secondary index on 'sbtest3'...
+Creating table 'sbtest4'...
+Inserting 10000 records into 'sbtest4'
+Creating a secondary index on 'sbtest4'...
+
+Benchmarks start: Wed May 27 11:55:45 PM CEST 2026
+========================================
+
+--- oltp_point_select ---
+sysbench 1.1.0-3ceba0b (using bundled LuaJIT 2.1.0-beta3)
+
+Running the test with following options:
+Number of threads: 4
+Initializing random number generator from current time
+
+
+Initializing worker threads...
+
+Threads started!
+
+SQL statistics:
+    queries performed:
+        read:                            140351
+        write:                           0
+        other:                           0
+        total:                           140351
+    transactions:                        140351 (13978.85 per sec.)
+    queries:                             140351 (13978.85 per sec.)
+    ignored errors:                      0      (0.00 per sec.)
+    reconnects:                          0      (0.00 per sec.)
+
+Throughput:
+    events/s (eps):                      13978.8501
+    time elapsed:                        10.0402s
+    total number of events:              140351
+
+Latency (ms):
+         min:                                    0.07
+         avg:                                    0.28
+         max:                                    7.09
+         95th percentile:                        0.38
+         sum:                                39921.67
+
+Threads fairness:
+    events (avg/stddev):           35087.7500/83.50
+    execution time (avg/stddev):   9.9804/0.00
+
+
+--- oltp_read_only ---
+sysbench 1.1.0-3ceba0b (using bundled LuaJIT 2.1.0-beta3)
+
+Running the test with following options:
+Number of threads: 4
+Initializing random number generator from current time
+
+
+Initializing worker threads...
+
+Threads started!
+
+SQL statistics:
+    queries performed:
+        read:                            89768
+        write:                           0
+        other:                           12824
+        total:                           102592
+    transactions:                        6412   (638.25 per sec.)
+    queries:                             102592 (10211.99 per sec.)
+    ignored errors:                      0      (0.00 per sec.)
+    reconnects:                          0      (0.00 per sec.)
+
+Throughput:
+    events/s (eps):                      638.2492
+    time elapsed:                        10.0462s
+    total number of events:              6412
+
+Latency (ms):
+         min:                                    4.20
+         avg:                                    6.24
+         max:                                   13.84
+         95th percentile:                        7.70
+         sum:                                40001.66
+
+Threads fairness:
+    events (avg/stddev):           1603.0000/7.45
+    execution time (avg/stddev):   10.0004/0.00
+
+
+--- oltp_read_write ---
+sysbench 1.1.0-3ceba0b (using bundled LuaJIT 2.1.0-beta3)
+
+Running the test with following options:
+Number of threads: 4
+Initializing random number generator from current time
+
+
+Initializing worker threads...
+
+Threads started!
+
+SQL statistics:
+    queries performed:
+        read:                            71414
+        write:                           20387
+        other:                           10197
+        total:                           101998
+    transactions:                        5096   (507.21 per sec.)
+    queries:                             101998 (10151.94 per sec.)
+    ignored errors:                      5      (0.50 per sec.)
+    reconnects:                          0      (0.00 per sec.)
+
+Throughput:
+    events/s (eps):                      507.2088
+    time elapsed:                        10.0471s
+    total number of events:              5096
+
+Latency (ms):
+         min:                                    5.06
+         avg:                                    7.85
+         max:                                   17.37
+         95th percentile:                       10.09
+         sum:                                39992.82
+
+Threads fairness:
+    events (avg/stddev):           1274.0000/9.08
+    execution time (avg/stddev):   9.9982/0.00
+
+
+--- oltp_update_index ---
+sysbench 1.1.0-3ceba0b (using bundled LuaJIT 2.1.0-beta3)
+
+Running the test with following options:
+Number of threads: 4
+Initializing random number generator from current time
+
+
+Initializing worker threads...
+
+Threads started!
+
+SQL statistics:
+    queries performed:
+        read:                            0
+        write:                           745
+        other:                           0
+        total:                           745
+    transactions:                        745    (74.09 per sec.)
+    queries:                             745    (74.09 per sec.)
+    ignored errors:                      1      (0.10 per sec.)
+    reconnects:                          0      (0.00 per sec.)
+
+Throughput:
+    events/s (eps):                      74.0921
+    time elapsed:                        10.0551s
+    total number of events:              745
+
+Latency (ms):
+         min:                                    0.11
+         avg:                                   53.76
+         max:                                10005.17
+         95th percentile:                        0.35
+         sum:                                40047.69
+
+Threads fairness:
+    events (avg/stddev):           186.2500/130.77
+    execution time (avg/stddev):   10.0119/0.00
+
+
+--- oltp_update_non_index ---
+sysbench 1.1.0-3ceba0b (using bundled LuaJIT 2.1.0-beta3)
+
+Running the test with following options:
+Number of threads: 4
+Initializing random number generator from current time
+
+
+Initializing worker threads...
+
+Threads started!
+
+SQL statistics:
+    queries performed:
+        read:                            0
+        write:                           485
+        other:                           0
+        total:                           485
+    transactions:                        485    (48.10 per sec.)
+    queries:                             485    (48.10 per sec.)
+    ignored errors:                      1      (0.10 per sec.)
+    reconnects:                          0      (0.00 per sec.)
+
+Throughput:
+    events/s (eps):                      48.0996
+    time elapsed:                        10.0832s
+    total number of events:              485
+
+Latency (ms):
+         min:                                    0.11
+         avg:                                   82.72
+         max:                                10004.29
+         95th percentile:                        0.42
+         sum:                                40119.74
+
+Threads fairness:
+    events (avg/stddev):           121.2500/34.81
+    execution time (avg/stddev):   10.0299/0.00
+
+
+========================================
+Script start:     2026-05-27 23:55:13
+Benchmarks start: 2026-05-27 23:55:45
+Script end:       2026-05-27 23:56:36
+Prep time:        32s
+Benchmark time:   51s
+Total time:       83s
+Results saved to: benchmark_safe_firebird_20260527_235513.txt
+========================================

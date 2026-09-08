@@ -86,3 +86,6 @@ prime
 stage
 *.snap
 /snap/snapcraft.yaml
+/src/drivers/firebird/.deps/
+*~
+/benchmark_*.txt
