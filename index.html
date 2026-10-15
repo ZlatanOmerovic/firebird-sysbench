@@ -4,512 +4,566 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>sysbench — Firebird Edition</title>
-<meta name="description" content="Firebird database support for sysbench, using the Firebird OO API. Benchmarks against MariaDB and PostgreSQL.">
+<meta name="description" content="Firebird database support for sysbench, using the Firebird OO API. Benchmarked against MariaDB and PostgreSQL.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap">
 <style>
-/* Layout: single measured column; the benchmark table breaks wider and scrolls in its own track. */
+/* Layout: fixed sidebar rail with scrollspy, measured content column, data tables break full width. */
 :root {
   --bg:        #fbfaf9;
   --surface:   #ffffff;
-  --border:    #e3dfdb;
+  --rail:      #f5f2ef;
+  --border:    #e4e0dc;
+  --border-sm: #efebe7;
   --fg:        #1c1917;
   --muted:     #6b645e;
-  --accent:    #b4451a;   /* ember — used only for emphasis and the Firebird bars */
-  --accent-dim:#f0e2da;
-  --other:     #44617a;   /* MariaDB / PostgreSQL bars */
-  --other-dim: #dfe6ec;
-  --warn-bg:   #fdf4ed;
+  --faint:     #948c84;
+  --accent:    #b4451a;
+  --accent-sm: #f6e8e0;
+  --other:     #44617a;
+  --warn-bg:   #fdf5ef;
   --code-bg:   #f4f1ee;
 
   --font-sans: "IBM Plex Sans", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
   --font-mono: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
 
+  --rail-w: 16rem;
+  --col:    48rem;
+
   color-scheme: light;
 }
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
-    --bg:        #15130f;
-    --surface:   #1d1a16;
-    --border:    #332d26;
-    --fg:        #f0ebe5;
-    --muted:     #a39a90;
-    --accent:    #f08a4b;
-    --accent-dim:#3a2518;
-    --other:     #87aac6;
-    --other-dim: #1f2c38;
-    --warn-bg:   #241a12;
-    --code-bg:   #211d19;
+    --bg: #15130f; --surface: #1d1a16; --rail: #191612; --border: #342e27; --border-sm: #262119;
+    --fg: #f0ebe5; --muted: #a39a90; --faint: #7d746b;
+    --accent: #f08a4b; --accent-sm: #33200f; --other: #87aac6;
+    --warn-bg: #221810; --code-bg: #211d19;
     color-scheme: dark;
   }
 }
 :root[data-theme="dark"] {
-  --bg:        #15130f;
-  --surface:   #1d1a16;
-  --border:    #332d26;
-  --fg:        #f0ebe5;
-  --muted:     #a39a90;
-  --accent:    #f08a4b;
-  --accent-dim:#3a2518;
-  --other:     #87aac6;
-  --other-dim: #1f2c38;
-  --warn-bg:   #241a12;
-  --code-bg:   #211d19;
+  --bg: #15130f; --surface: #1d1a16; --rail: #191612; --border: #342e27; --border-sm: #262119;
+  --fg: #f0ebe5; --muted: #a39a90; --faint: #7d746b;
+  --accent: #f08a4b; --accent-sm: #33200f; --other: #87aac6;
+  --warn-bg: #221810; --code-bg: #211d19;
   color-scheme: dark;
 }
 
 * { box-sizing: border-box; }
-html { -webkit-text-size-adjust: 100%; }
+html { -webkit-text-size-adjust: 100%; scroll-behavior: smooth; }
+@media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }
 body {
-  margin: 0;
-  background: var(--bg);
-  color: var(--fg);
-  font-family: var(--font-sans);
-  font-size: 16px;
-  line-height: 1.6;
+  margin: 0; background: var(--bg); color: var(--fg);
+  font-family: var(--font-sans); font-size: 16px; line-height: 1.65;
 }
-.wrap {
-  max-width: 68rem;
-  margin: 0 auto;
-  padding-left: max(20px, env(safe-area-inset-left, 0px));
-  padding-right: max(20px, env(safe-area-inset-right, 0px));
-}
-.measure { max-width: 42rem; }
 
-/* ---- masthead ---- */
-header { border-bottom: 1px solid var(--border); background: var(--surface); }
-header .wrap { padding-block: 3.5rem 2.75rem; }
+/* ---------- shell ---------- */
+.shell { display: grid; grid-template-columns: var(--rail-w) minmax(0, 1fr); }
+
+/* ---------- sidebar ---------- */
+.rail {
+  background: var(--rail); border-right: 1px solid var(--border);
+  padding: 2.25rem 1.5rem 2.5rem;
+  position: sticky; top: 0; align-self: start; height: 100vh;
+  display: flex; flex-direction: column; gap: 1.75rem;
+  overflow-y: auto;
+}
+.brand { display: block; text-decoration: none; color: inherit; }
+.brand .n { font-weight: 600; font-size: 1.05rem; letter-spacing: -.01em; display: block; }
+.brand .n em { font-style: normal; color: var(--accent); }
+.brand .v {
+  font-family: var(--font-mono); font-size: .68rem; letter-spacing: .1em;
+  text-transform: uppercase; color: var(--faint); margin-top: .35rem; display: block;
+}
+nav ol { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: .15rem; counter-reset: s; }
+nav a {
+  display: flex; gap: .7rem; align-items: baseline;
+  padding: .4rem .6rem; border-radius: 4px;
+  font-size: .9rem; color: var(--muted); text-decoration: none;
+  border-left: 2px solid transparent; transition: color .15s, background .15s;
+}
+nav a .num {
+  font-family: var(--font-mono); font-size: .7rem; color: var(--faint);
+  font-variant-numeric: tabular-nums;
+}
+nav a:hover { color: var(--fg); background: var(--accent-sm); }
+nav a.active { color: var(--accent); background: var(--accent-sm); font-weight: 500; }
+nav a.active .num { color: var(--accent); }
+.rail .out { margin-top: auto; display: flex; flex-direction: column; gap: .3rem; }
+.rail .out a { font-family: var(--font-mono); font-size: .78rem; color: var(--muted); text-decoration: none; }
+.rail .out a:hover { color: var(--accent); text-decoration: underline; }
+
+/* ---------- content ---------- */
+main { min-width: 0; }
+.inner {
+  max-width: calc(var(--col) + 8rem);
+  margin: 0 auto;
+  padding-left: max(2.5rem, env(safe-area-inset-left, 0px));
+  padding-right: max(2.5rem, env(safe-area-inset-right, 0px));
+}
+.col { max-width: var(--col); }
+
+.hero { padding-block: 4rem 3rem; border-bottom: 1px solid var(--border); }
 .eyebrow {
-  font-family: var(--font-mono);
-  font-size: .75rem;
-  letter-spacing: .14em;
-  text-transform: uppercase;
-  color: var(--accent);
-  margin: 0 0 1rem;
+  font-family: var(--font-mono); font-size: .72rem; letter-spacing: .14em;
+  text-transform: uppercase; color: var(--accent); margin: 0 0 1rem;
 }
 h1 {
-  font-size: clamp(2rem, 1.3rem + 2.6vw, 3.1rem);
-  line-height: 1.1;
-  font-weight: 600;
-  letter-spacing: -.022em;
-  margin: 0 0 1rem;
-  text-wrap: balance;
+  font-size: clamp(2.1rem, 1.2rem + 2.8vw, 3.2rem); line-height: 1.08;
+  font-weight: 600; letter-spacing: -.025em; margin: 0 0 1.1rem; text-wrap: balance;
 }
-h1 .em { color: var(--accent); }
-.lede { font-size: 1.125rem; color: var(--muted); margin: 0; max-width: 40rem; }
-
+h1 em { font-style: normal; color: var(--accent); }
+.lede { font-size: 1.15rem; color: var(--muted); margin: 0; max-width: 36rem; }
 .facts {
-  display: flex; flex-wrap: wrap; gap: 0 2.5rem;
-  margin-top: 2.25rem; padding-top: 1.5rem;
-  border-top: 1px solid var(--border);
-  list-style: none; padding-left: 0;
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(10rem, 1fr));
+  gap: 1.25rem 2rem; margin: 2.5rem 0 0; padding-top: 1.5rem;
+  border-top: 1px solid var(--border-sm);
 }
-.facts div { min-width: 0; }
 .facts dt {
-  font-family: var(--font-mono); font-size: .7rem; letter-spacing: .12em;
-  text-transform: uppercase; color: var(--muted);
+  font-family: var(--font-mono); font-size: .68rem; letter-spacing: .12em;
+  text-transform: uppercase; color: var(--faint);
 }
-.facts dd { margin: .2rem 0 0; font-weight: 500; font-variant-numeric: tabular-nums; }
+.facts dd { margin: .25rem 0 0; font-weight: 500; }
 
-/* ---- sections ---- */
-section { padding-block: 3.25rem; border-bottom: 1px solid var(--border); }
+section { padding-block: 3.5rem; border-bottom: 1px solid var(--border); scroll-margin-top: 1rem; }
 h2 {
-  font-size: 1.5rem; font-weight: 600; letter-spacing: -.015em;
-  margin: 0 0 .5rem; text-wrap: balance;
+  font-size: 1.65rem; font-weight: 600; letter-spacing: -.02em;
+  margin: 0 0 1rem; text-wrap: balance;
 }
 h3 {
-  font-family: var(--font-mono); font-size: .78rem; letter-spacing: .1em;
-  text-transform: uppercase; color: var(--muted);
-  margin: 2.25rem 0 .75rem; font-weight: 600;
+  font-family: var(--font-mono); font-size: .76rem; letter-spacing: .1em;
+  text-transform: uppercase; color: var(--muted); font-weight: 600;
+  margin: 2.5rem 0 .85rem;
 }
-p { margin: 0 0 1rem; }
-a { color: var(--accent); text-decoration-thickness: 1px; text-underline-offset: .18em; }
-a:focus-visible, summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 2px; }
+p { margin: 0 0 1.1rem; }
+a { color: var(--accent); text-underline-offset: .18em; }
+a:focus-visible, summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 3px; }
 
 pre {
-  background: var(--code-bg); border: 1px solid var(--border);
-  border-radius: 6px; padding: 1rem 1.1rem; margin: 0 0 1rem;
-  overflow-x: auto; font-family: var(--font-mono); font-size: .83rem; line-height: 1.65;
+  background: var(--code-bg); border: 1px solid var(--border-sm); border-radius: 6px;
+  padding: 1.1rem 1.25rem; margin: 0 0 1.25rem; overflow-x: auto;
+  font-family: var(--font-mono); font-size: .82rem; line-height: 1.7;
+  max-width: var(--col);
 }
 code { font-family: var(--font-mono); font-size: .88em; }
 p code, li code, td code { background: var(--code-bg); padding: .1em .35em; border-radius: 3px; }
-.cmt { color: var(--muted); }
+.cmt { color: var(--faint); }
+ul.plain { padding-left: 1.15rem; margin: 0 0 1.1rem; max-width: var(--col); }
+ul.plain li { margin-bottom: .45rem; }
 
-/* ---- benchmark table ---- */
-.tablewrap { overflow-x: auto; margin: 1.5rem 0 1rem; }
+/* ---------- tables ---------- */
+.tablewrap { overflow-x: auto; margin: 1.75rem 0 1.25rem; }
 table { border-collapse: collapse; width: 100%; font-size: .875rem; }
-caption { text-align: left; color: var(--muted); font-size: .85rem; padding-bottom: .75rem; }
-th, td { padding: .5rem .7rem; text-align: left; border-bottom: 1px solid var(--border); }
+caption { text-align: left; color: var(--muted); font-size: .85rem; padding-bottom: .85rem; }
+th, td { padding: .55rem .75rem; text-align: left; border-bottom: 1px solid var(--border-sm); }
 thead th {
-  font-family: var(--font-mono); font-size: .7rem; letter-spacing: .07em;
-  text-transform: uppercase; color: var(--muted); font-weight: 600;
-  white-space: nowrap; vertical-align: bottom;
+  font-family: var(--font-mono); font-size: .68rem; letter-spacing: .07em;
+  text-transform: uppercase; color: var(--faint); font-weight: 600;
+  white-space: nowrap; border-bottom-color: var(--border);
 }
 tbody th { font-family: var(--font-mono); font-size: .8rem; font-weight: 500; white-space: nowrap; }
-td { font-variant-numeric: tabular-nums; text-align: right; white-space: nowrap; }
 tbody tr:hover { background: var(--code-bg); }
-.bar { display: block; height: 3px; border-radius: 2px; margin-top: .3rem; }
-.fb .bar  { background: var(--accent); }
-.ot .bar  { background: var(--other); }
-.fb { background: linear-gradient(var(--accent-dim), var(--accent-dim)) left/0 no-repeat; }
-td.lead { font-weight: 600; }
+.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; position: relative; }
+.num span.v { position: relative; z-index: 1; }
+.num::before {
+  content: ""; position: absolute; right: .75rem; bottom: .3rem; height: 2px;
+  width: calc(var(--fill, 0) * .78); border-radius: 1px; background: var(--other); opacity: .55;
+}
+.num.fb::before { background: var(--accent); }
+td.lead span.v { font-weight: 600; }
 
-/* ---- callout ---- */
-.callout {
-  background: var(--warn-bg); border: 1px solid var(--border);
-  border-left: 3px solid var(--accent);
-  border-radius: 4px; padding: 1.25rem 1.4rem; margin: 1.5rem 0;
-}
-.callout h3 { margin-top: 0; color: var(--accent); }
-.callout p:last-child { margin-bottom: 0; }
+/* benchmark table breaks past the text column */
+.wide { max-width: none; }
 
-.beforeafter {
-  display: flex; flex-wrap: wrap; gap: 1rem; margin: 1.25rem 0 1.5rem;
-  list-style: none; padding: 0;
-}
-.beforeafter li {
-  flex: 1 1 11rem; min-width: 0;
-  border: 1px solid var(--border); border-radius: 6px;
-  background: var(--surface); padding: .9rem 1rem;
-}
-.beforeafter .k {
-  font-family: var(--font-mono); font-size: .68rem; letter-spacing: .1em;
-  text-transform: uppercase; color: var(--muted);
-}
-.beforeafter .v {
-  font-family: var(--font-mono); font-size: 1.55rem; font-weight: 600;
-  font-variant-numeric: tabular-nums; line-height: 1.2; margin-top: .15rem;
-}
-.beforeafter .n { font-size: .82rem; color: var(--muted); }
-.strike .v { color: var(--muted); text-decoration: line-through; text-decoration-thickness: 1px; }
-.now .v { color: var(--accent); }
-
-/* ---- versions ---- */
-.vers { font-size: .9rem; }
-.vers td { text-align: left; white-space: normal; }
-.vers tbody th { font-size: .85rem; }
+.vers td { white-space: normal; }
 .pill {
-  font-family: var(--font-mono); font-size: .68rem; letter-spacing: .06em;
+  font-family: var(--font-mono); font-size: .66rem; letter-spacing: .06em;
   text-transform: uppercase; padding: .15rem .45rem; border-radius: 3px;
   border: 1px solid var(--border); color: var(--muted); white-space: nowrap;
 }
 .pill.yes { color: var(--accent); border-color: var(--accent); }
 
-ul.plain { padding-left: 1.1rem; margin: 0 0 1rem; }
-ul.plain li { margin-bottom: .4rem; }
+/* ---------- correction tiles ---------- */
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr)); gap: 1rem; margin: 1.5rem 0; max-width: var(--col); list-style: none; padding: 0; }
+.tiles li { border: 1px solid var(--border); border-radius: 6px; background: var(--surface); padding: 1rem 1.1rem; }
+.tiles .k { font-family: var(--font-mono); font-size: .66rem; letter-spacing: .1em; text-transform: uppercase; color: var(--faint); }
+.tiles .v { font-family: var(--font-mono); font-size: 1.6rem; font-weight: 600; font-variant-numeric: tabular-nums; line-height: 1.2; margin-top: .2rem; }
+.tiles .n { font-size: .82rem; color: var(--muted); }
+.tiles .strike .v { color: var(--faint); text-decoration: line-through; text-decoration-thickness: 1px; }
+.tiles .now .v { color: var(--accent); }
 
-footer { padding-block: 2.5rem 3.5rem; color: var(--muted); font-size: .875rem; }
-footer a { color: var(--fg); }
-.links { display: flex; flex-wrap: wrap; gap: .5rem 1.5rem; margin: 0 0 1.5rem; padding: 0; list-style: none; }
-.links a { font-family: var(--font-mono); font-size: .85rem; }
+.tiles.send li { background: var(--surface); }
+.tiles .s { font-size: 1rem; font-weight: 500; margin-top: .3rem; word-break: break-word; }
+.tiles .s a { text-decoration: none; }
+.tiles .s a:hover { text-decoration: underline; }
+.by { font-weight: 500; color: var(--fg); }
+.callout {
+  background: var(--warn-bg); border: 1px solid var(--border); border-left: 3px solid var(--accent);
+  border-radius: 4px; padding: 1.3rem 1.45rem; margin: 1.75rem 0; max-width: var(--col);
+}
+.callout h3 { margin-top: 0; color: var(--accent); }
+.callout p:last-child { margin-bottom: 0; }
 
-@media (max-width: 640px) {
-  header .wrap { padding-block: 2.5rem 2rem; }
-  section { padding-block: 2.25rem; }
-  .facts { gap: 1rem 2rem; }
+footer { padding-block: 2.5rem 4rem; color: var(--muted); font-size: .875rem; }
+
+/* ---------- responsive ---------- */
+@media (max-width: 1000px) {
+  .shell { grid-template-columns: 1fr; }
+  .rail {
+    position: sticky; top: 0; z-index: 10; height: auto;
+    flex-direction: row; align-items: center; gap: 1.25rem;
+    padding: .75rem max(1rem, env(safe-area-inset-left, 0px));
+    border-right: 0; border-bottom: 1px solid var(--border); overflow-x: auto;
+  }
+  .brand .v, .rail .out { display: none; }
+  .brand { flex: 0 0 auto; }
+  nav ol { flex-direction: row; gap: .2rem; }
+  nav a { white-space: nowrap; padding: .3rem .55rem; }
+  nav a .num { display: none; }
+  .inner { padding-left: max(1.25rem, env(safe-area-inset-left, 0px)); padding-right: max(1.25rem, env(safe-area-inset-right, 0px)); }
+  .hero { padding-block: 2.75rem 2.25rem; }
+  section { padding-block: 2.5rem; scroll-margin-top: 4rem; }
 }
 </style>
 </head>
 <body>
 
-<header>
-  <div class="wrap">
-    <p class="eyebrow">Fork of akopytov/sysbench</p>
-    <h1>sysbench — <span class="em">Firebird Edition</span></h1>
-    <p class="lede">
-      Run the standard OLTP benchmarks used for MySQL and PostgreSQL against
-      Firebird 3, 4, 5 and 6 — through the Firebird OO API, not the legacy ISC layer.
-    </p>
-    <dl class="facts">
-      <div><dt>Driver</dt><dd>OO API · fb_c_api.h</dd></div>
-      <div><dt>Bulk loading</dt><dd>IBatch</dd></div>
-      <div><dt>Workloads</dt><dd>10 OLTP scripts</dd></div>
-      <div><dt>Lua scripts</dt><dd>Byte-identical to upstream</dd></div>
-    </dl>
-  </div>
-</header>
+<div class="shell">
 
-<section>
-  <div class="wrap">
-    <div class="measure">
-      <h2>Quick start</h2>
-      <p>
-        Building needs headers from Firebird 5 or newer — <code>fb_c_api.h</code> first
-        shipped in FB5. The resulting binary still connects to FB3 and FB4 servers.
-      </p>
+  <aside class="rail">
+    <a class="brand" href="#top">
+      <span class="n">sysbench <em>Firebird</em></span>
+      <span class="v">OO API driver</span>
+    </a>
+    <nav aria-label="Sections">
+      <ol>
+        <li><a href="#start"><span class="num">01</span> Quick start</a></li>
+        <li><a href="#versions"><span class="num">02</span> Supported versions</a></li>
+        <li><a href="#benchmarks"><span class="num">03</span> Benchmarks</a></li>
+        <li><a href="#withdrawn"><span class="num">04</span> A withdrawn result</a></li>
+        <li><a href="#fair"><span class="num">05</span> Keeping it fair</a></li>
+        <li><a href="#contribute"><span class="num">06</span> Contribute results</a></li>
+      </ol>
+    </nav>
+    <div class="out">
+      <a href="https://github.com/ZlatanOmerovic/firebird-sysbench">Repository →</a>
+      <a href="https://github.com/akopytov/sysbench">Upstream sysbench →</a>
+      <a href="https://firebirdsql.org">Firebird →</a>
     </div>
+  </aside>
+
+  <main>
+    <div class="inner">
+
+      <div class="hero" id="top">
+        <p class="eyebrow">Fork of akopytov/sysbench</p>
+        <h1>sysbench — <em>Firebird Edition</em></h1>
+        <p class="lede">
+          Run the standard OLTP benchmarks used for MySQL and PostgreSQL against
+          Firebird 3, 4, 5 and 6 — through the Firebird OO API, not the legacy ISC layer.
+        </p>
+        <dl class="facts">
+          <div><dt>Driver</dt><dd>OO API · fb_c_api.h</dd></div>
+          <div><dt>Bulk loading</dt><dd>IBatch</dd></div>
+          <div><dt>Workloads</dt><dd>10 OLTP scripts</dd></div>
+          <div><dt>Lua scripts</dt><dd>Byte-identical to upstream</dd></div>
+        </dl>
+      </div>
+
+      <section id="start">
+        <h2>Quick start</h2>
+        <div class="col">
+          <p>
+            Building needs headers from Firebird 5 or newer — <code>fb_c_api.h</code> first
+            shipped in FB5. The resulting binary still connects to FB3 and FB4 servers.
+          </p>
+        </div>
 <pre><span class="cmt"># build</span>
 ./autogen.sh
 ./configure --with-mysql --with-pgsql --with-firebird=/opt/firebird
 make -j$(nproc)
 
-<span class="cmt"># create a database, then prepare and run</span>
-isql -user SYSDBA -password masterkey &lt;&lt;&lt; \
-  "CREATE DATABASE 'localhost:/var/lib/firebird/sbtest.fdb' DEFAULT CHARACTER SET UTF8; QUIT;"
-
+<span class="cmt"># prepare, then run</span>
 ./src/sysbench ./src/lua/oltp_read_write.lua \
-  --db-driver=firebird --firebird-db=localhost:/var/lib/firebird/sbtest.fdb \
+  --db-driver=firebird \
+  --firebird-db=localhost:/var/lib/firebird/sbtest.fdb \
   --firebird-user=SYSDBA --firebird-password=masterkey \
   --tables=4 --table-size=10000 prepare
 
 ./src/sysbench ./src/lua/oltp_read_write.lua \
-  --db-driver=firebird --firebird-db=localhost:/var/lib/firebird/sbtest.fdb \
+  --db-driver=firebird \
+  --firebird-db=localhost:/var/lib/firebird/sbtest.fdb \
   --firebird-user=SYSDBA --firebird-password=masterkey \
   --tables=4 --table-size=10000 --threads=4 --time=10 run</pre>
-    <div class="measure">
-      <h3>Driver options</h3>
-      <ul class="plain">
-        <li><code>--firebird-db</code> — connection string, e.g. <code>localhost/3055:/path/sbtest.fdb</code></li>
-        <li><code>--firebird-user</code>, <code>--firebird-password</code></li>
-        <li><code>--firebird-client</code> — which <code>libfbclient.so</code> to <code>dlopen</code>, so one binary can drive several Firebird versions</li>
-      </ul>
-    </div>
-  </div>
-</section>
+        <h3>Driver options</h3>
+        <ul class="plain">
+          <li><code>--firebird-db</code> — connection string, e.g. <code>localhost/3055:/path/sbtest.fdb</code></li>
+          <li><code>--firebird-user</code>, <code>--firebird-password</code></li>
+          <li><code>--firebird-client</code> — which <code>libfbclient.so</code> to <code>dlopen</code>, so one binary can drive several Firebird versions</li>
+        </ul>
+      </section>
 
-<section>
-  <div class="wrap">
-    <div class="measure">
-      <h2>Supported versions</h2>
-      <p>
-        The client library is loaded at runtime, and the driver checks its
-        <code>IUtil</code> vtable before using it. That check is about the client,
-        not the server — an FB3 <em>server</em> benchmarks fine when driven by an
-        FB5 client.
-      </p>
-    </div>
-    <div class="tablewrap">
-      <table class="vers">
-        <thead>
-          <tr><th scope="col">Version</th><th scope="col">As server</th><th scope="col">As client library</th><th scope="col">Batch API</th></tr>
-        </thead>
-        <tbody>
-          <tr><th scope="row">Firebird 6.0</th><td>Tested (trunk build)</td><td>Works</td><td><span class="pill yes">yes</span></td></tr>
-          <tr><th scope="row">Firebird 5.0</th><td>Reference platform</td><td>Works</td><td><span class="pill yes">yes</span></td></tr>
-          <tr><th scope="row">Firebird 4.0</th><td>Tested</td><td>Works — cannot be built against</td><td><span class="pill yes">yes</span></td></tr>
-          <tr><th scope="row">Firebird 3.0</th><td>Tested</td><td>Refused at startup (vtable v2)</td><td><span class="pill">no — server-side</span></td></tr>
-        </tbody>
-      </table>
-    </div>
-    <div class="measure">
-      <p>
-        The Batch API is a Firebird 4+ server feature, so bulk loading against FB3
-        falls back to single-row inserts. That shows up plainly in the
-        <code>bulk_insert</code> row below. For Firebird 3 and 2.5 clients, the
-        legacy ISC driver lives on the <code>firebird-isc</code> branch.
-      </p>
-    </div>
-  </div>
-</section>
+      <section id="versions">
+        <h2>Supported versions</h2>
+        <div class="col">
+          <p>
+            The client library is loaded at runtime and the driver checks its
+            <code>IUtil</code> vtable before using it. That check is about the client,
+            not the server — an FB3 <em>server</em> benchmarks fine when driven by an
+            FB5 client.
+          </p>
+        </div>
+        <div class="tablewrap col">
+          <table class="vers">
+            <thead>
+              <tr><th scope="col">Version</th><th scope="col">As server</th><th scope="col">As client library</th><th scope="col">Batch API</th></tr>
+            </thead>
+            <tbody>
+              <tr><th scope="row">Firebird 6.0</th><td>Tested (trunk)</td><td>Works</td><td><span class="pill yes">yes</span></td></tr>
+              <tr><th scope="row">Firebird 5.0</th><td>Reference platform</td><td>Works</td><td><span class="pill yes">yes</span></td></tr>
+              <tr><th scope="row">Firebird 4.0</th><td>Tested</td><td>Works — cannot be built against</td><td><span class="pill yes">yes</span></td></tr>
+              <tr><th scope="row">Firebird 3.0</th><td>Tested</td><td>Refused at startup (vtable v2)</td><td><span class="pill">server-side, no</span></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="col">
+          <p>
+            The Batch API is a Firebird 4+ server feature, so bulk loading against FB3
+            falls back to single-row inserts — visible in the <code>bulk_insert</code>
+            row below. For Firebird 3 and 2.5 clients, the legacy ISC driver lives on
+            the <code>firebird-isc</code> branch.
+          </p>
+        </div>
+      </section>
 
-<section>
-  <div class="wrap">
-    <div class="measure">
-      <h2>Benchmarks</h2>
-      <p>
-        Four tables of 10,000 rows, four threads, ten seconds per benchmark.
-        All six engines on the same disk, with buffer caches matched at 128 MB,
-        and the Firebird database on disk rather than tmpfs.
-      </p>
+      <section id="benchmarks">
+        <h2>Benchmarks</h2>
+        <div class="col">
+          <p>
+            Four tables of 10,000 rows, four threads, ten seconds per benchmark. All six
+            engines on the same disk, buffer caches matched at 128 MB, and the Firebird
+            database on disk rather than tmpfs.
+          </p>
+        </div>
+        <div class="tablewrap wide">
+          <table>
+            <caption>Transactions per second, 2026-10-14. Higher is better.</caption>
+            <thead>
+              <tr>
+                <th scope="col">Benchmark</th>
+                <th scope="col" class="num">FB 3.0.14</th>
+                <th scope="col" class="num">FB 4.0.7</th>
+                <th scope="col" class="num">FB 5.0.4</th>
+                <th scope="col" class="num">FB 6.0.0</th>
+                <th scope="col" class="num">MariaDB 11.8</th>
+                <th scope="col" class="num">PostgreSQL 17</th>
+              </tr>
+            </thead>
+            <tbody id="benchbody"></tbody>
+          </table>
+        </div>
+        <div class="col">
+          <p>
+            Firebird trails on every workload here: reads roughly 3–4× behind, writes an
+            order of magnitude. The cursor open/close round trips in Firebird's wire
+            protocol are visible on the read benchmarks and are not something the driver
+            can remove.
+          </p>
+        </div>
+      </section>
+
+      <section id="withdrawn">
+        <h2>A result we had to withdraw</h2>
+        <div class="col">
+          <p>
+            The benchmark write-ups in this repository reported Firebird winning
+            <code>oltp_insert</code> by about 4× — 3,687 TPS against roughly 900 — and
+            stated that the figure did not come from batching. Both halves were wrong.
+            The numbers stood from May until October 2026.
+          </p>
+        </div>
+        <ul class="tiles">
+          <li class="strike"><div class="k">Published</div><div class="v">3,687</div><div class="n">TPS — “leads by ~4×”</div></li>
+          <li class="now"><div class="k">Measured</div><div class="v">153</div><div class="n">TPS — same workload, fixed driver</div></li>
+          <li><div class="k">MariaDB</div><div class="v">1,149</div><div class="n">TPS — ~7.5× faster</div></li>
+        </ul>
+        <div class="col">
+          <p>
+            <code>oltp_insert.lua</code> sends one <code>INSERT</code> per event through
+            <code>query()</code>. The driver matched that statement shape and diverted it
+            into the OO API batch path, which buffers 1,000 rows per round trip and commits
+            them with <code>commitRetaining</code>. MariaDB and PostgreSQL committed every
+            statement and paid an fsync each time. The gap was the measurement, not the engine.
+          </p>
+          <p>
+            The driver now batches only while a bulk load is genuinely in progress, which is
+            how <code>prepare</code> and <code>bulk_insert.lua</code> arrive. Data loading is
+            unchanged: preparing 4 × 10,000 rows still takes 5.0 seconds, and
+            <code>bulk_insert</code> still measures about 40,000 TPS.
+          </p>
+        </div>
+        <div class="callout">
+          <h3>Single runs are not reliable here</h3>
+          <p>
+            Running the identical suite twice, back to back, moved Firebird's write
+            benchmarks by factors of 0.37–1.42× while MariaDB and PostgreSQL stayed within
+            3%. One cause is background garbage collection: Firebird 5's first pass ran
+            shortly after a million-row table was dropped, and its reads were depressed
+            roughly 2× until a second pass.
+          </p>
+          <p>
+            Every figure here is the second of two consecutive runs. The write rows should
+            not be read as version rankings.
+          </p>
+        </div>
+      </section>
+
+      <section id="fair">
+        <h2>Keeping it fair</h2>
+        <ul class="plain">
+          <li>Firebird data on disk, never tmpfs — same physical disk and mount options as the other engines.</li>
+          <li>Buffer caches matched at 128 MB across all engines.</li>
+          <li>Per-statement autocommit when no explicit <code>BEGIN</code> was sent, so each statement pays its own fsync, as on MySQL and PostgreSQL.</li>
+          <li>Batching confined to the bulk-load API, where every engine that has one is free to use it.</li>
+          <li>Raw sysbench output committed alongside the results, each file recording its own connection string and client library.</li>
+        </ul>
+        <div class="col">
+          <p>
+            Corrections so far have come from Firebird core developers reviewing the
+            numbers. The tmpfs imbalance, the unmatched caches and the long-transaction
+            inserts were all found that way.
+          </p>
+        </div>
+      </section>
+
+      <section id="contribute">
+        <h2>Contribute your results</h2>
+        <div class="col">
+          <p>
+            Every number on this page comes from one machine: Debian 13 under WSL2 on a
+            single-socket AMD desktop. That is enough to compare engines against each
+            other on identical hardware, and not enough to say how Firebird behaves on
+            bare metal, on more cores, on NVMe, or on a different filesystem. Results
+            from other hardware are welcome, and they are the most useful thing anyone
+            can send.
+          </p>
+        </div>
+
+        <h3>Run the suite</h3>
+<pre><span class="cmt"># one suite per engine; each writes benchmark_&lt;driver&gt;_&lt;timestamp&gt;.txt</span>
+TABLES=4 TABLE_SIZE=10000 THREADS=4 TIME=10 \
+  FIREBIRD_DB=localhost:/var/lib/firebird/sbtest.fdb \
+  ./run_benchmarks.sh firebird
+
+./run_benchmarks.sh mysql
+./run_benchmarks.sh pgsql
+
+<span class="cmt"># run each engine twice and send both — the second is the one to quote</span></pre>
+
+        <h3>Before you measure</h3>
+        <ul class="plain">
+          <li>Put the Firebird database <strong>on disk</strong>, not under <code>/tmp</code> if that is tmpfs on your system.</li>
+          <li>Match the buffer caches: <code>DefaultDbCachePages = 16384</code> at an 8 KB page size is the 128 MB used here, and give MariaDB and PostgreSQL the same.</li>
+          <li>Keep the machine otherwise idle. A compile running alongside a benchmark is visible in the numbers.</li>
+          <li>Run each engine twice. Firebird's write benchmarks moved by factors between repeats on this hardware, so a single pass is not evidence.</li>
+        </ul>
+
+        <h3>What to send</h3>
+        <div class="col">
+          <p>
+            The raw <code>benchmark_*.txt</code> files, unedited. Each one records its own
+            connection string and resolved client library in the header, so the engine and
+            port are already in the file. Add a note of the CPU, the disk, the filesystem,
+            and the Firebird, MariaDB and PostgreSQL versions you ran against.
+          </p>
+          <p>
+            Post them as a comment on the results thread, which already holds the runs
+            above — no need to open a separate issue. By email works too. Pull requests
+            adding files under <code>results/&lt;date&gt;-&lt;your-handle&gt;/</code> are
+            equally welcome, as is disagreement with the numbers here: every correction so
+            far came from someone pointing out that a comparison was not fair.
+          </p>
+        </div>
+        <ul class="tiles send">
+          <li>
+            <div class="k">Post results</div>
+            <div class="s"><a href="https://github.com/ZlatanOmerovic/firebird-sysbench/issues/4">Issue #4 — results thread</a></div>
+            <div class="n">Comment with your files attached</div>
+          </li>
+          <li>
+            <div class="k">Or email</div>
+            <div class="s"><a href="mailto:ascent.ba@gmail.com">ascent.ba@gmail.com</a></div>
+            <div class="n">Attach the raw benchmark_*.txt</div>
+          </li>
+        </ul>
+        <div class="col">
+        </div>
+      </section>
+
+      <footer>
+        <div class="col">
+          <p class="by">
+            Firebird driver and benchmarks by
+            <a href="https://github.com/ZlatanOmerovic">Zlatan Omerović</a> ·
+            <a href="mailto:ascent.ba@gmail.com">ascent.ba@gmail.com</a>
+          </p>
+          <p>
+            Measured on Debian 13 under WSL2, AMD, single socket. Absolute numbers transfer
+            only as ratios. A fork of
+            <a href="https://github.com/akopytov/sysbench">sysbench</a> by Alexey Kopytov;
+            GPLv2, same as upstream.
+          </p>
+        </div>
+      </footer>
+
     </div>
+  </main>
+</div>
 
-    <div class="tablewrap">
-      <table>
-        <caption>Transactions per second, 2026-10-14. Higher is better.</caption>
-        <thead>
-          <tr>
-            <th scope="col">Benchmark</th>
-            <th scope="col">FB 3.0.14</th>
-            <th scope="col">FB 4.0.7</th>
-            <th scope="col">FB 5.0.4</th>
-            <th scope="col">FB 6.0.0</th>
-            <th scope="col">MariaDB 11.8</th>
-            <th scope="col">PostgreSQL 17</th>
-          </tr>
-        </thead>
-        <tbody>
-          <tr><th scope="row">oltp_point_select</th>
-            <td class="fb">14,080<span class="bar" style="width:23%"></span></td>
-            <td class="fb">15,233<span class="bar" style="width:25%"></span></td>
-            <td class="fb">14,510<span class="bar" style="width:24%"></span></td>
-            <td class="fb">15,331<span class="bar" style="width:25%"></span></td>
-            <td class="ot lead">60,164<span class="bar" style="width:100%"></span></td>
-            <td class="ot">44,451<span class="bar" style="width:74%"></span></td></tr>
-          <tr><th scope="row">oltp_read_only</th>
-            <td class="fb">522<span class="bar" style="width:20%"></span></td>
-            <td class="fb">549<span class="bar" style="width:21%"></span></td>
-            <td class="fb">535<span class="bar" style="width:21%"></span></td>
-            <td class="fb">563<span class="bar" style="width:22%"></span></td>
-            <td class="ot lead">2,591<span class="bar" style="width:100%"></span></td>
-            <td class="ot">2,293<span class="bar" style="width:89%"></span></td></tr>
-          <tr><th scope="row">oltp_read_write</th>
-            <td class="fb">54<span class="bar" style="width:6%"></span></td>
-            <td class="fb">54<span class="bar" style="width:6%"></span></td>
-            <td class="fb">55<span class="bar" style="width:6%"></span></td>
-            <td class="fb">59<span class="bar" style="width:7%"></span></td>
-            <td class="ot lead">891<span class="bar" style="width:100%"></span></td>
-            <td class="ot">762<span class="bar" style="width:86%"></span></td></tr>
-          <tr><th scope="row">oltp_insert</th>
-            <td class="fb">148<span class="bar" style="width:13%"></span></td>
-            <td class="fb">147<span class="bar" style="width:13%"></span></td>
-            <td class="fb">153<span class="bar" style="width:13%"></span></td>
-            <td class="fb">149<span class="bar" style="width:13%"></span></td>
-            <td class="ot lead">1,149<span class="bar" style="width:100%"></span></td>
-            <td class="ot">1,117<span class="bar" style="width:97%"></span></td></tr>
-          <tr><th scope="row">oltp_delete</th>
-            <td class="fb">56<span class="bar" style="width:4%"></span></td>
-            <td class="fb">286<span class="bar" style="width:21%"></span></td>
-            <td class="fb">66<span class="bar" style="width:5%"></span></td>
-            <td class="fb">94<span class="bar" style="width:7%"></span></td>
-            <td class="ot lead">1,368<span class="bar" style="width:100%"></span></td>
-            <td class="ot">1,311<span class="bar" style="width:96%"></span></td></tr>
-          <tr><th scope="row">oltp_update_index</th>
-            <td class="fb">137<span class="bar" style="width:12%"></span></td>
-            <td class="fb">139<span class="bar" style="width:12%"></span></td>
-            <td class="fb">55<span class="bar" style="width:5%"></span></td>
-            <td class="fb">48<span class="bar" style="width:4%"></span></td>
-            <td class="ot lead">1,175<span class="bar" style="width:100%"></span></td>
-            <td class="ot">1,132<span class="bar" style="width:96%"></span></td></tr>
-          <tr><th scope="row">oltp_update_non_index</th>
-            <td class="fb">181<span class="bar" style="width:15%"></span></td>
-            <td class="fb">189<span class="bar" style="width:16%"></span></td>
-            <td class="fb">51<span class="bar" style="width:4%"></span></td>
-            <td class="fb">62<span class="bar" style="width:5%"></span></td>
-            <td class="ot lead">1,168<span class="bar" style="width:100%"></span></td>
-            <td class="ot">1,140<span class="bar" style="width:98%"></span></td></tr>
-          <tr><th scope="row">select_random_points</th>
-            <td class="fb">11,795<span class="bar" style="width:36%"></span></td>
-            <td class="fb">11,512<span class="bar" style="width:35%"></span></td>
-            <td class="fb">11,021<span class="bar" style="width:33%"></span></td>
-            <td class="fb">11,752<span class="bar" style="width:36%"></span></td>
-            <td class="ot">28,330<span class="bar" style="width:86%"></span></td>
-            <td class="ot lead">33,051<span class="bar" style="width:100%"></span></td></tr>
-          <tr><th scope="row">select_random_ranges</th>
-            <td class="fb">12,033<span class="bar" style="width:47%"></span></td>
-            <td class="fb">11,916<span class="bar" style="width:47%"></span></td>
-            <td class="fb">11,810<span class="bar" style="width:47%"></span></td>
-            <td class="fb">10,984<span class="bar" style="width:43%"></span></td>
-            <td class="ot lead">25,378<span class="bar" style="width:100%"></span></td>
-            <td class="ot">24,423<span class="bar" style="width:96%"></span></td></tr>
-          <tr><th scope="row">bulk_insert</th>
-            <td class="fb">5,614<span class="bar" style="width:2%"></span></td>
-            <td class="fb">46,285<span class="bar" style="width:20%"></span></td>
-            <td class="fb">39,585<span class="bar" style="width:17%"></span></td>
-            <td class="fb">45,086<span class="bar" style="width:20%"></span></td>
-            <td class="ot">162,575<span class="bar" style="width:70%"></span></td>
-            <td class="ot lead">230,866<span class="bar" style="width:100%"></span></td></tr>
-        </tbody>
-      </table>
-    </div>
+<script>
+// Benchmark data — one row per workload, values in engine order.
+const ENGINES = 6, FB = 4;
+const ROWS = [
+  ["oltp_point_select",     [14080, 15233, 14510, 15331, 60164, 44451]],
+  ["oltp_read_only",        [522, 549, 535, 563, 2591, 2293]],
+  ["oltp_read_write",       [54, 54, 55, 59, 891, 762]],
+  ["oltp_insert",           [148, 147, 153, 149, 1149, 1117]],
+  ["oltp_delete",           [56, 286, 66, 94, 1368, 1311]],
+  ["oltp_update_index",     [137, 139, 55, 48, 1175, 1132]],
+  ["oltp_update_non_index", [181, 189, 51, 62, 1168, 1140]],
+  ["select_random_points",  [11795, 11512, 11021, 11752, 28330, 33051]],
+  ["select_random_ranges",  [12033, 11916, 11810, 10984, 25378, 24423]],
+  ["bulk_insert",           [5614, 46285, 39585, 45086, 162575, 230866]]
+];
+const fmt = n => n.toLocaleString("en-US");
+document.getElementById("benchbody").innerHTML = ROWS.map(([name, vals]) => {
+  const max = Math.max(...vals);
+  const cells = vals.map((v, i) => {
+    const pct = (v / max * 100).toFixed(1);
+    const cls = "num" + (i < FB ? " fb" : "") + (v === max ? " lead" : "");
+    return `<td class="${cls}" style="--fill:${pct}px"><span class="v">${fmt(v)}</span></td>`;
+  }).join("");
+  return `<tr><th scope="row">${name}</th>${cells}</tr>`;
+}).join("");
 
-    <div class="measure">
-      <p>
-        Firebird trails on every workload here. Reads are roughly 3–4× behind,
-        and writes an order of magnitude. The cursor open/close round trips in
-        Firebird's wire protocol are visible on the read benchmarks and are not
-        something the driver can remove.
-      </p>
-    </div>
-  </div>
-</section>
-
-<section>
-  <div class="wrap">
-    <div class="measure">
-      <h2>A result we had to withdraw</h2>
-      <p>
-        The benchmark write-ups in this repository reported Firebird winning
-        <code>oltp_insert</code> by about 4× — 3,687 TPS against roughly 900 —
-        and stated that the figure did not come from batching. Both halves were
-        wrong. The numbers stood from May until October 2026.
-      </p>
-    </div>
-
-    <ul class="beforeafter">
-      <li class="strike">
-        <div class="k">Published</div>
-        <div class="v">3,687</div>
-        <div class="n">TPS — “leads by ~4×”</div>
-      </li>
-      <li class="now">
-        <div class="k">Measured</div>
-        <div class="v">153</div>
-        <div class="n">TPS — same workload, fixed driver</div>
-      </li>
-      <li>
-        <div class="k">MariaDB</div>
-        <div class="v">1,149</div>
-        <div class="n">TPS — ~7.5× faster</div>
-      </li>
-    </ul>
-
-    <div class="measure">
-      <p>
-        <code>oltp_insert.lua</code> sends one <code>INSERT</code> per event through
-        <code>query()</code>. The driver matched that statement shape and diverted it
-        into the OO API batch path, which buffers 1,000 rows per round trip and commits
-        them with <code>commitRetaining</code>. MariaDB and PostgreSQL committed every
-        statement and paid an fsync each time. The gap was the measurement, not the engine.
-      </p>
-      <p>
-        The driver now batches only while a bulk load is genuinely in progress, which is
-        how <code>prepare</code> and <code>bulk_insert.lua</code> arrive. Data loading is
-        unchanged: preparing 4 × 10,000 rows still takes 5.0 seconds, and
-        <code>bulk_insert</code> still measures about 40,000 TPS.
-      </p>
-    </div>
-
-    <div class="callout">
-      <h3>Single runs are not reliable here</h3>
-      <p>
-        Running the identical suite twice, back to back, moved Firebird's write
-        benchmarks by factors of 0.37–1.42× while MariaDB and PostgreSQL stayed
-        within 3%. One cause is background garbage collection: Firebird 5's first
-        pass ran shortly after a million-row table was dropped, and its reads were
-        depressed roughly 2× until a second pass.
-      </p>
-      <p>
-        Every figure on this page is the second of two consecutive runs. The write
-        rows should not be read as version rankings.
-      </p>
-    </div>
-  </div>
-</section>
-
-<section>
-  <div class="wrap">
-    <div class="measure">
-      <h2>How the comparison is kept fair</h2>
-      <ul class="plain">
-        <li>Firebird data on disk, never tmpfs — same physical disk and mount options as the other engines.</li>
-        <li>Buffer caches matched at 128 MB across all three engines.</li>
-        <li>Per-statement autocommit when no explicit <code>BEGIN</code> was sent, matching MySQL and PostgreSQL semantics, so each statement pays its own fsync.</li>
-        <li>Batching confined to the bulk-load API, where every engine that has one is free to use it.</li>
-        <li>Raw sysbench output committed alongside the results, each file recording its own connection string and client library.</li>
-      </ul>
-      <p>
-        Corrections so far have come from Firebird core developers reviewing the
-        numbers. The tmpfs imbalance, the unmatched caches and the long-transaction
-        inserts were all found that way.
-      </p>
-    </div>
-  </div>
-</section>
-
-<footer>
-  <div class="wrap">
-    <ul class="links">
-      <li><a href="https://github.com/ZlatanOmerovic/firebird-sysbench">Repository</a></li>
-      <li><a href="https://github.com/akopytov/sysbench">Upstream sysbench</a></li>
-      <li><a href="https://firebirdsql.org">Firebird</a></li>
-    </ul>
-    <p>
-      Measured on Debian 13 under WSL2, AMD, single socket. Absolute numbers
-      transfer only as ratios. GPLv2, same as upstream sysbench.
-    </p>
-  </div>
-</footer>
+// Scrollspy: highlight the section currently in view.
+const links = [...document.querySelectorAll('nav a')];
+const byId = Object.fromEntries(links.map(a => [a.getAttribute('href').slice(1), a]));
+const seen = new Map();
+const spy = new IntersectionObserver(entries => {
+  entries.forEach(e => seen.set(e.target.id, e));
+  let best = null;
+  for (const [id, e] of seen) {
+    if (!e.isIntersecting) continue;
+    if (!best || e.boundingClientRect.top < best.boundingClientRect.top) best = e;
+  }
+  if (!best) return;
+  links.forEach(a => a.classList.remove('active'));
+  byId[best.target.id]?.classList.add('active');
+}, { rootMargin: "-10% 0px -70% 0px", threshold: 0 });
+document.querySelectorAll('main section[id]').forEach(s => spy.observe(s));
+</script>
 
 </body>
 </html>
