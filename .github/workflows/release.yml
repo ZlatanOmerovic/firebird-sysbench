@@ -87,8 +87,11 @@ jobs:
         run: |
           dnf -y install --allowerasing \
             rpm-build gcc gcc-c++ make automake libtool pkgconfig \
-            libaio-devel openssl-devel postgresql-devel libzstd-devel \
+            libaio-devel openssl-devel libzstd-devel \
             mariadb-connector-c-devel curl tar gzip git findutils python3
+          # pg_config is in postgresql-devel on EL, libpq-devel on Fedora
+          dnf -y install postgresql-devel || dnf -y install libpq-devel
+          command -v pg_config || { echo "pg_config not found"; exit 1; }
 
       - name: Install Firebird 5 headers
         run: |

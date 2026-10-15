@@ -19,7 +19,12 @@ BuildRequires: mariadb-devel
 BuildRequires: mysql-devel
 %endif
 %endif
+%if 0%{?fedora}
+# pg_config lives in libpq-devel on Fedora, not postgresql-devel
+BuildRequires: libpq-devel
+%else
 BuildRequires: postgresql-devel
+%endif
 BuildRequires: make
 BuildRequires: automake
 BuildRequires: libtool
