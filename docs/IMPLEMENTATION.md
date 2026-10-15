@@ -163,7 +163,23 @@ unsigned nullOff = IMessageMetadata_getNullOffset(meta, st, idx);
 
 `BEGIN`/`COMMIT`/`ROLLBACK` and everything else when `--db-ps-mode=disable`
 are marked `stmt->emulated`; those substitute values into the SQL text and
-route through `firebird_drv_query()`.
+route through `fb_query()`.
+
+An emulated statement has no parameters and its SQL text is never reused,
+so a server-side prepared statement buys nothing. When the emulated
+statement is created, `fb_describe_template()` prepares the template once,
+reads its type and frees it. Every execution then sends the literal SQL text
+with one attachment-level call:
+
+| Statement | Call |
+|---|---|
+| SELECT | `IAttachment_openCursor()` with no output metadata; the format comes from `IResultSet_getMetadata()` |
+| INSERT, UPDATE, DELETE without RETURNING | `IAttachment_execute()` with no messages |
+| anything else | generic path: prepare → openCursor/execute → free |
+
+Over the wire `IAttachment_execute()` is one `op_exec_immediate2` round trip
+instead of prepare + execute. Plain `query()` calls have no template to
+describe, so they always take the generic path.
 
 ### Result set handling
 
@@ -181,9 +197,10 @@ The OLTP workloads are dominated by single-row point selects, so
    fetch, then materialise every remaining row with
    `fb_extract_column_alloc()`. The row array doubles from a capacity of 64.
 
-`firebird_drv_query()` (non-prepared path) always uses the general
-`fb_result_t` form. Either way all rows are client-side before `fetch_row()`
-is called, matching how the PostgreSQL driver hands out `PGresult` values.
+`fb_query()` (non-prepared path) always uses the general `fb_result_t` form,
+built by `fb_fetch_all()`; a fetch error is reported, not cut short into a
+partial result. Either way all rows are client-side before `fetch_row()` is
+called, matching how the PostgreSQL driver hands out `PGresult` values.
 
 `fb_free_result()` frees the string allocations tracked in the result's
 `strings` array; the single-row fast path has nothing to free.

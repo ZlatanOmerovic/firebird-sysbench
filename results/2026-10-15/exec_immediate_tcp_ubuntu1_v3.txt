@@ -1,0 +1,57 @@
+Emulated statements (--db-ps-mode=disable) through attachment-level calls — orig (d9df300) vs new3
+  new3: SELECT -> IAttachment::openCursor (no output metadata), INSERT/UPDATE/DELETE -> IAttachment::execute;
+        ps-mode=auto unchanged (prepared IStatement, same code as orig).
+Host: ubuntu-1 (LXD VM on clawnuc3), 2 vCPU, 3 GB, Ubuntu 22.04
+Firebird 5.0.5.1878 HQbird, SuperServer, DefaultDbCachePages 50K, LINGER 300, Forced Writes on
+Client: libfbclient 5.0.5, localhost:/var/lib/sbei/sbtest.fdb (TCPv4, wire crypt on); 2 tables x 10000 rows
+Note: autocommit/commit fsync limits every run below to a few hundred tps, so the
+throughput table is mostly noise; the round-trip table is the stable result.
+
+=== Correctness over TCP (ei_check.lua: 20 read + 8 DML checks)
+new3 ps-mode=auto: FAIL switch 1..1 (singleton): got 0 rows, expected 1 FAIL switch 1..10 (multi, fallback): got 8 rows, expected 10 RESULT: 28 checks, 2 failed 
+new3 ps-mode=disable: FAIL switch 1..1 (singleton): got 0 rows, expected 1 FAIL switch 1..10 (multi, fallback): got 8 rows, expected 10 RESULT: 28 checks, 2 failed 
+orig ps-mode=auto: FAIL switch 1..1 (singleton): got 0 rows, expected 1 FAIL switch 1..10 (multi, fallback): got 8 rows, expected 10 RESULT: 28 checks, 2 failed 
+orig ps-mode=disable: FAIL switch 1..1 (singleton): got 0 rows, expected 1 FAIL switch 1..10 (multi, fallback): got 8 rows, expected 10 FAIL division by zero: no error RESULT: 28 checks, 3 failed 
+
+=== Network round trips per event (strace, 1 thread, 3000 events, autocommit, no BEGIN)
+script                   bin   mode       sendto recvfrom send/event
+oltp_point_select        orig  disable     15007    12005       5.00
+oltp_point_select        new3  disable     15015    12011       5.00
+oltp_point_select        orig  auto         3013     3009       1.00
+oltp_point_select        new3  auto         3013     3009       1.00
+select_random_ranges     orig  disable     15007    12005       5.00
+select_random_ranges     new3  disable     15011    12008       5.00
+select_random_ranges     orig  auto         3011     3008       1.00
+select_random_ranges     new3  auto         3011     3008       1.00
+oltp_update_index        orig  disable     15007    12005       5.00
+oltp_update_index        new3  disable      9015     9011       3.00
+oltp_update_index        orig  auto         9011     9007       3.00
+oltp_update_index        new3  auto         9011     9007       3.00
+oltp_delete              orig  disable     15007    12005       5.00
+oltp_delete              new3  disable      9015     9011       3.00
+oltp_delete              orig  auto         9011     9007       3.00
+oltp_delete              new3  auto         9011     9007       3.00
+
+=== Correctness over TCP after fixing data-dependent checks (fresh tables)
+new3 ps-mode=auto: RESULT: 28 checks, 0 failed 
+new3 ps-mode=disable: RESULT: 28 checks, 0 failed 
+orig ps-mode=auto: RESULT: 28 checks, 0 failed 
+orig ps-mode=disable: FAIL division by zero: no error RESULT: 28 checks, 1 failed 
+
+=== Throughput over TCP, ps-mode=disable, 2 threads, 10 s per run; new3 runs first, then orig
+script                 rep  |  new3 qps  new3 tps |  orig qps  orig tps |    qps | ign.err n/o, fatal n/o
+oltp_point_select      1    |    481.15    481.15 |    495.79    495.79 |    -3% | 0/0, 0/0
+oltp_point_select      2    |    476.46    476.46 |    385.88    385.88 |   +23% | 0/0, 0/0
+oltp_read_only         1    |   1842.23    115.14 |   1297.37     81.09 |   +42% | 0/0, 0/0
+oltp_read_only         2    |   1306.69     81.67 |   1942.94    121.43 |   -33% | 0/0, 0/0
+oltp_update_index      1    |    122.61    122.61 |    110.30    110.30 |   +11% | 0/0, 0/0
+oltp_update_index      2    |    120.40    120.40 |    122.34    122.34 |    -2% | 1/0, 0/0
+oltp_update_non_index  1    |    147.85    147.85 |    148.00    148.00 |    -0% | 0/0, 0/0
+oltp_update_non_index  2    |    143.86    143.86 |    139.33    139.33 |    +3% | 0/0, 0/0
+oltp_write_only        1    |    396.47     66.08 |    381.31     63.55 |    +4% | 0/0, 0/0
+oltp_write_only        2    |    385.38     64.23 |    378.83     63.09 |    +2% | 0/2, 0/0
+oltp_read_write        1    |    872.38     43.62 |    682.69     34.13 |   +28% | 0/0, 0/0
+oltp_read_write        2    |    900.26     45.01 |    852.49     42.62 |    +6% | 0/0, 0/0
+oltp_delete            1    |    200.31    200.31 |    219.91    219.91 |    -9% | 0/0, 0/0
+oltp_delete            2    |    219.26    219.26 |    219.36    219.36 |    -0% | 0/0, 0/0
+done
