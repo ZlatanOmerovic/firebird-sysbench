@@ -1,0 +1,107 @@
+SYSBENCH_CHANGE_PLAN.md section 4 checks on cc2 (container sysbench-nvme)
+orig = d9df300 (src/sysbench.orig); new = this branch (f99b426..54b185b)
+Bench: AMD Ryzen 5 5600G, servers pinned to CPUs 0-2,6-8, sysbench to 3-5,9-11, TCP 127.0.0.1,
+4 tables x 1M rows, 30 s per run, Firebird 5.0.4.1812 SuperServer (page buffers 102400,
+Forced Writes on, LINGER 3600, WireCrypt off), MariaDB 11.8.6 (buffer pool 1.6 GB).
+The host runs production services (load average about 4 on 12 CPUs during the runs).
+
+OVERLAP: from 19:36:29 to 19:43:29 another session ran MariaDB write tests in the same
+container. The warm-up, all "1.1 mysql" rows and all 1-thread "point" rows of the first
+block are disturbed; the re-run below replaces them. Rows after 19:43:29 are clean.
+
+=== plan section 4 checks, 2026-10-15 19:36:29, 30 s per run, pinned: servers 0-2,6-8, sysbench 3-5,9-11
+warm-up                                      new   oltp_point_select      8 | qps   44405.34 tps   44405.34 | avg   0.18 p95   0.39 ms | ign    0 fatal 0 
+warm-up                                      new   oltp_point_select      8 | qps   77850.91 tps   77850.91 | avg   0.10 p95   0.17 ms | ign    0 fatal 0 
+--- 1.1 MariaDB point_select through the scripts' TRANSPORT (expect tcp ~23.6K, local ~29.4K)
+1.1 mysql TRANSPORT=tcp #1                   new   oltp_point_select      1 | qps   13063.12 tps   13063.12 | avg   0.08 p95   0.28 ms | ign    0 fatal 0 
+1.1 mysql TRANSPORT=tcp #2                   new   oltp_point_select      1 | qps    4794.01 tps    4794.01 | avg   0.21 p95   0.65 ms | ign    0 fatal 0 
+1.1 mysql TRANSPORT=local #1                 new   oltp_point_select      1 | qps    7619.78 tps    7619.78 | avg   0.13 p95   0.47 ms | ign    0 fatal 0 
+1.1 mysql TRANSPORT=local #2                 new   oltp_point_select      1 | qps   14483.09 tps   14483.09 | avg   0.07 p95   0.10 ms | ign    0 fatal 0 
+--- 3 + 4: Firebird point_select: orig, new cursor (rc-ro), new cursor snapshot-rw, new auto (expect auto >= 95K at 8 threads)
+point orig #1                                orig  oltp_point_select      1 | qps   12832.73 tps   12832.73 | avg   0.08 p95   0.19 ms | ign    0 fatal 0 
+point new cursor rc-ro #1                    new   oltp_point_select      1 | qps   13414.23 tps   13414.23 | avg   0.07 p95   0.15 ms | ign    0 fatal 0 
+point new cursor snapshot-rw #1              new   oltp_point_select      1 | qps   17514.48 tps   17514.48 | avg   0.06 p95   0.08 ms | ign    0 fatal 0 
+point new auto (defaults) #1                 new   oltp_point_select      1 | qps   13641.66 tps   13641.66 | avg   0.07 p95   0.17 ms | ign    0 fatal 0 
+point orig #2                                orig  oltp_point_select      1 | qps   10719.52 tps   10719.52 | avg   0.09 p95   0.20 ms | ign    0 fatal 0 
+point new cursor rc-ro #2                    new   oltp_point_select      1 | qps   17690.49 tps   17690.49 | avg   0.06 p95   0.08 ms | ign    0 fatal 0 
+point new cursor snapshot-rw #2              new   oltp_point_select      1 | qps   14236.67 tps   14236.67 | avg   0.07 p95   0.11 ms | ign    0 fatal 0 
+point new auto (defaults) #2                 new   oltp_point_select      1 | qps   11158.99 tps   11158.99 | avg   0.09 p95   0.25 ms | ign    0 fatal 0 
+point orig #1                                orig  oltp_point_select      8 | qps   76429.62 tps   76429.62 | avg   0.10 p95   0.16 ms | ign    0 fatal 0 
+point new cursor rc-ro #1                    new   oltp_point_select      8 | qps   74888.34 tps   74888.34 | avg   0.11 p95   0.17 ms | ign    0 fatal 0 
+point new cursor snapshot-rw #1              new   oltp_point_select      8 | qps   75708.05 tps   75708.05 | avg   0.11 p95   0.16 ms | ign    0 fatal 0 
+point new auto (defaults) #1                 new   oltp_point_select      8 | qps   97785.92 tps   97785.92 | avg   0.08 p95   0.12 ms | ign    0 fatal 0 
+point orig #2                                orig  oltp_point_select      8 | qps   76538.60 tps   76538.60 | avg   0.10 p95   0.16 ms | ign    0 fatal 0 
+point new cursor rc-ro #2                    new   oltp_point_select      8 | qps   66117.71 tps   66117.71 | avg   0.12 p95   0.18 ms | ign    0 fatal 0 
+point new cursor snapshot-rw #2              new   oltp_point_select      8 | qps   76529.43 tps   76529.43 | avg   0.10 p95   0.16 ms | ign    0 fatal 0 
+point new auto (defaults) #2                 new   oltp_point_select      8 | qps   98773.35 tps   98773.35 | avg   0.08 p95   0.12 ms | ign    0 fatal 0 
+point orig #1                                orig  oltp_point_select     16 | qps   73524.82 tps   73524.82 | avg   0.22 p95   0.36 ms | ign    0 fatal 0 
+point new cursor rc-ro #1                    new   oltp_point_select     16 | qps   73657.94 tps   73657.94 | avg   0.22 p95   0.36 ms | ign    0 fatal 0 
+point new auto (defaults) #1                 new   oltp_point_select     16 | qps   99328.76 tps   99328.76 | avg   0.16 p95   0.25 ms | ign    0 fatal 0 
+point orig #2                                orig  oltp_point_select     16 | qps   71781.92 tps   71781.92 | avg   0.22 p95   0.37 ms | ign    0 fatal 0 
+point new cursor rc-ro #2                    new   oltp_point_select     16 | qps   73310.78 tps   73310.78 | avg   0.22 p95   0.36 ms | ign    0 fatal 0 
+point new auto (defaults) #2                 new   oltp_point_select     16 | qps   99153.23 tps   99153.23 | avg   0.16 p95   0.25 ms | ign    0 fatal 0 
+--- 3: oltp_read_only, auto against cursor (no FATAL, same reads per transaction)
+read_only new select-mode=cursor             new   oltp_read_only         8 | qps   39958.12 tps    2497.38 | avg   3.20 p95   4.18 ms | ign    0 fatal 0 
+read_only new select-mode=auto               new   oltp_read_only         8 | qps   41670.42 tps    2604.40 | avg   3.07 p95   4.10 ms | ign    0 fatal 0 
+--- 4: --firebird-autocommit-select=on, rc-ro (expect ~8.7K at 1 thread, ~36K at 8)
+point new autocommit-select #1               new   oltp_point_select      1 | qps    9129.60 tps    9129.60 | avg   0.11 p95   0.12 ms | ign    0 fatal 0 
+point new autocommit-select #2               new   oltp_point_select      1 | qps    8729.90 tps    8729.90 | avg   0.11 p95   0.13 ms | ign    0 fatal 0 
+point new autocommit-select #1               new   oltp_point_select      8 | qps   38831.98 tps   38831.98 | avg   0.21 p95   0.26 ms | ign    0 fatal 0 
+point new autocommit-select #2               new   oltp_point_select      8 | qps   39324.06 tps   39324.06 | avg   0.20 p95   0.26 ms | ign    0 fatal 0 
+--- 4: oltp_read_only, begin-tpb snapshot-rw against snapshot-ro (expect ro higher, page writes ~0)
+read_only new begin-tpb=snapshot-rw #1       new   oltp_read_only         8 | qps   41876.06 tps    2617.25 | avg   3.06 p95   4.03 ms | ign    0 fatal 0 | 1099504 statements: page fetches 33.86 (37234313), page reads 0.00 (0), page writes 0.07 (78540), page marks 0.14 (157089), records read 29.30 (32213423)
+read_only new begin-tpb=snapshot-ro #1       new   oltp_read_only         8 | qps   45642.97 tps    2852.69 | avg   2.80 p95   3.30 ms | ign    0 fatal 0 | 1198358 statements: page fetches 33.87 (40586389), page reads 0.00 (0), page writes 0.00 (6), page marks 0.14 (171222), records read 14.63 (17526648)
+read_only new begin-tpb=snapshot-rw #2       new   oltp_read_only         8 | qps   41496.61 tps    2593.54 | avg   3.08 p95   4.18 ms | ign    0 fatal 0 | 1089606 statements: page fetches 33.87 (36900577), page reads 0.00 (0), page writes 0.07 (77837), page marks 0.14 (155682), records read 29.30 (31922063)
+read_only new begin-tpb=snapshot-ro #2       new   oltp_read_only         8 | qps   39400.93 tps    2462.56 | avg   3.25 p95   5.88 ms | ign    0 fatal 0 | 1034460 statements: page fetches 33.87 (35033107), page reads 0.00 (0), page writes 0.00 (6), page marks 0.14 (147799), records read 25.64 (26526867)
+--- All: write workloads, orig against new defaults (expect +-3 %, no new errors)
+oltp_read_write orig #1                      orig  oltp_read_write        8 | qps    4174.27 tps     208.71 | avg  38.18 p95  82.96 ms | ign    0 fatal 0 
+oltp_read_write new #1                       new   oltp_read_write        8 | qps    4578.71 tps     228.94 | avg  34.94 p95  41.85 ms | ign    0 fatal 0 
+oltp_read_write orig #2                      orig  oltp_read_write        8 | qps    4492.33 tps     224.62 | avg  35.61 p95  44.98 ms | ign    0 fatal 0 
+oltp_read_write new #2                       new   oltp_read_write        8 | qps    4658.78 tps     232.94 | avg  34.32 p95  42.61 ms | ign    0 fatal 0 
+oltp_insert orig #1                          orig  oltp_insert            8 | qps     708.01 tps     708.01 | avg  11.29 p95  14.73 ms | ign    0 fatal 0 
+oltp_insert new #1                           new   oltp_insert            8 | qps     721.05 tps     721.05 | avg  11.09 p95  14.73 ms | ign    0 fatal 0 
+oltp_insert orig #2                          orig  oltp_insert            8 | qps     729.33 tps     729.33 | avg  10.96 p95  14.21 ms | ign    0 fatal 0 
+oltp_insert new #2                           new   oltp_insert            8 | qps     717.82 tps     717.82 | avg  11.14 p95  14.46 ms | ign    0 fatal 0 
+oltp_update_index orig #1                    orig  oltp_update_index      8 | qps     540.64 tps     540.64 | avg  14.79 p95  34.33 ms | ign    0 fatal 0 
+oltp_update_index new #1                     new   oltp_update_index      8 | qps     765.50 tps     765.50 | avg  10.45 p95  12.75 ms | ign    0 fatal 0 
+oltp_update_index orig #2                    orig  oltp_update_index      8 | qps     438.78 tps     438.78 | avg  18.23 p95  31.94 ms | ign    0 fatal 0 
+oltp_update_index new #2                     new   oltp_update_index      8 | qps     761.76 tps     761.76 | avg  10.50 p95  12.98 ms | ign    1 fatal 0 
+--- 2.2: prepare --tables=4 --threads=4 on an empty database (expect 4 tables and indexes)
+2.2 prepare orig: FATAL lines 6, tables and k-indexes:  1 1 , rows: 100000////
+2.2 prepare new: FATAL lines 0, tables and k-indexes:  4 4 , rows: 100000/100000/100000/100000/
+done
+
+=== re-run of overlapped rows, 2026-10-15 20:01:46
+20:01:46 warm-up                                      new   oltp_point_select    8 | qps   97636.43 | avg   0.08 p95   0.12 ms | ign    0 fatal 0
+20:02:16 warm-up                                      new   oltp_point_select    8 | qps  101320.18 | avg   0.08 p95   0.15 ms | ign    0 fatal 0
+20:02:46 1.1 mysql TRANSPORT=tcp #1                   new   oltp_point_select    1 | qps   23499.07 | avg   0.04 p95   0.05 ms | ign    0 fatal 0
+20:03:16 1.1 mysql TRANSPORT=tcp #2                   new   oltp_point_select    1 | qps   23919.29 | avg   0.04 p95   0.05 ms | ign    0 fatal 0
+20:03:46 1.1 mysql TRANSPORT=local #1                 new   oltp_point_select    1 | qps   29241.49 | avg   0.03 p95   0.04 ms | ign    0 fatal 0
+20:04:16 1.1 mysql TRANSPORT=local #2                 new   oltp_point_select    1 | qps   30231.82 | avg   0.03 p95   0.04 ms | ign    0 fatal 0
+20:04:46 point orig #1                                orig  oltp_point_select    1 | qps   20613.89 | avg   0.05 p95   0.06 ms | ign    0 fatal 0
+20:05:16 point new cursor rc-ro #1                    new   oltp_point_select    1 | qps   20727.90 | avg   0.05 p95   0.06 ms | ign    0 fatal 0
+20:05:46 point new cursor snapshot-rw #1              new   oltp_point_select    1 | qps   20745.64 | avg   0.05 p95   0.06 ms | ign    0 fatal 0
+20:06:16 point new auto (defaults) #1                 new   oltp_point_select    1 | qps   22094.70 | avg   0.05 p95   0.05 ms | ign    0 fatal 0
+20:06:46 point orig #2                                orig  oltp_point_select    1 | qps   19867.59 | avg   0.05 p95   0.06 ms | ign    0 fatal 0
+20:07:16 point new cursor rc-ro #2                    new   oltp_point_select    1 | qps   20450.79 | avg   0.05 p95   0.06 ms | ign    0 fatal 0
+20:07:47 point new cursor snapshot-rw #2              new   oltp_point_select    1 | qps   20912.11 | avg   0.05 p95   0.06 ms | ign    0 fatal 0
+20:08:17 point new auto (defaults) #2                 new   oltp_point_select    1 | qps   22219.42 | avg   0.04 p95   0.05 ms | ign    0 fatal 0
+done
+
+=== 8 threads, read TPB rc-ro against snapshot-rw (cursor), 2026-10-15 20:09:13
+20:09:13 point new cursor rc-ro #1                    new   oltp_point_select    8 | qps   76050.97 | avg   0.11 p95   0.16 ms | ign    0 fatal 0
+20:09:43 point new cursor snapshot-rw #1              new   oltp_point_select    8 | qps   65940.60 | avg   0.12 p95   0.18 ms | ign    0 fatal 0
+20:10:13 point new cursor rc-ro #2                    new   oltp_point_select    8 | qps   71277.00 | avg   0.11 p95   0.17 ms | ign    0 fatal 0
+20:10:43 point new cursor snapshot-rw #2              new   oltp_point_select    8 | qps   75058.39 | avg   0.11 p95   0.16 ms | ign    0 fatal 0
+20:11:13 point new cursor rc-ro #3                    new   oltp_point_select    8 | qps   75755.35 | avg   0.11 p95   0.16 ms | ign    0 fatal 0
+20:11:44 point new cursor snapshot-rw #3              new   oltp_point_select    8 | qps   75100.42 | avg   0.11 p95   0.16 ms | ign    0 fatal 0
+done
+
+Commit check for oltp_update_index (ubuntu-1, FB 5.0.5, 1 table x 20000, 2 threads, 5 s):
+  orig: updates reported 602, sum(k) grew by 602
+  new:  updates reported 822, sum(k) grew by 822
+Every UPDATE is committed in both builds; the cause of the higher update rate is not known yet.
+
+Not checked: "old client library (Firebird 3 libfbclient)". The driver refuses a Firebird 3
+client at startup since d9df300 (FIREBIRD.md, Version support), and the bench has no
+Firebird 3 client. The Firebird 3 server fallback of the rc TPB (rec_version) is untested.
