@@ -10,4 +10,5 @@ Skip test if the Firebird driver is not available.
     --firebird-db=STRING       Firebird database connection string [localhost:/tmp/sbtest.fdb]
     --firebird-user=STRING     Firebird user [SYSDBA]
     --firebird-password=STRING Firebird password [masterkey]
+    --firebird-client=STRING   Path to libfbclient.so to load at runtime (overrides default) [libfbclient.so]
   

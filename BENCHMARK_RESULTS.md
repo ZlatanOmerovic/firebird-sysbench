@@ -26,16 +26,19 @@
 
 | Benchmark | MariaDB 11.8 | PostgreSQL 17.10 | Firebird 5.0.4 |
 |---|---:|---:|---:|
-| oltp_point_select | **56,498** | 42,731 | 14,835 |
-| oltp_read_only | **2,533** | 2,252 | 565 |
-| oltp_read_write | **814** | 733 | 50 |
-| oltp_insert | 822 | 938 | **3,687** |
-| oltp_delete | **1,003** | 942 | 283 |
-| oltp_update_index | **834** | 805 | 137 |
-| oltp_update_non_index | **879** | 874 | 77 |
-| select_random_points | 27,838 | **32,137** | 11,969 |
-| select_random_ranges | **25,940** | 24,498 | 12,907 |
-| bulk_insert | 166,314 | **343,105** | 31,802 |
+| oltp_point_select | **60,164** | 44,451 | 14,510 |
+| oltp_read_only | **2,591** | 2,293 | 535 |
+| oltp_read_write | **891** | 762 | 55 |
+| oltp_insert | **1,149** | 1,117 | 153 |
+| oltp_delete | **1,368** | 1,311 | 66 |
+| oltp_update_index | **1,175** | 1,132 | 55 |
+| oltp_update_non_index | **1,168** | 1,140 | 51 |
+| select_random_points | 28,330 | **33,051** | 11,021 |
+| select_random_ranges | **25,378** | 24,423 | 11,810 |
+| bulk_insert | 162,575 | **230,866** | 39,585 |
+
+Measured 2026-10-14 with the driver fix described under *Correction* below.
+Each figure is the second of two consecutive runs; see *Run-to-run variance*.
 
 ### Caveat: TABLE_SIZE=10K creates an artificial conflict storm
 
@@ -46,6 +49,14 @@ using WAIT-style locking. Numbers should be read alongside the 1M
 dataset below.
 
 ## TABLE_SIZE=1M, scaling 1 → 2 → 4 threads, TPS
+
+> **Not re-measured.** The figures in this section predate the
+> `query()`-insert batching fix and have not been repeated at 1M rows. The
+> `oltp_insert` rows are invalid — Firebird's values there were produced by
+> the Batch API path and are inflated by roughly an order of magnitude. The
+> read rows are unaffected by that fix, but were single runs, and Firebird's
+> write rows carry the run-to-run variance described above.
+
 
 | Benchmark | DB | 1t | 2t | 4t |
 |---|---|---:|---:|---:|
@@ -105,14 +116,56 @@ the engine concurrency limit Dmitry Yemanov flagged for follow-up.
 
 ### Insert behaviour
 
-`oltp_insert` at 10K: **Firebird leads by ~4×** (3,687 vs ~900 for
-MariaDB/PostgreSQL). Genuine engine advantage on small in-cache
-inserts. Not from batching — `oltp_insert` uses prepared statements,
-not the Batch API.
+`oltp_insert` at 10K: **Firebird is ~7.5× slower** (153 vs 1,149 for
+MariaDB and 1,117 for PostgreSQL).
 
-`bulk_insert` at 10K: **PostgreSQL leads at 343K TPS**, then MariaDB
-at 166K, Firebird at 32K. Where Firebird previously appeared to win
-this on tmpfs, the honest on-disk number tells the real story.
+An earlier revision of this document reported the opposite — Firebird
+leading by ~4× at 3,687 TPS, described as a "genuine engine advantage"
+and explicitly "not from batching". That was wrong on both counts. See
+*Correction* below.
+
+`bulk_insert` at 10K: **PostgreSQL leads at 231K TPS**, then MariaDB at
+163K, Firebird at 40K. This benchmark legitimately uses the bulk API, so
+batching applies to every engine that has it and the comparison is fair.
+
+## Correction — oltp_insert was measuring the Batch API
+
+`oltp_insert.lua` sends one `INSERT INTO … VALUES (…)` per event through
+`con:query()`. The Firebird driver pattern-matched that statement shape and
+diverted it into the OO API `IBatch` path, which buffers 1,000 rows per
+round trip and commits them with `commitRetaining`. MariaDB and PostgreSQL
+committed every statement and paid an fsync each time. The 4× "win" was
+that asymmetry, not the engine.
+
+The driver now batches only while a bulk insert is genuinely in progress —
+`prepare` and `bulk_insert.lua`, which reach the driver through
+`db_bulk_insert_init()`/`done()`. An INSERT issued through `query()` is
+executed and committed when the call returns, matching the other drivers.
+
+This is the same class of problem as the tmpfs and buffer-cache issues
+listed below: a measurement artifact flattering Firebird. Data loading is
+unaffected — `prepare` of 4 × 10k rows still takes 5.0s, and `bulk_insert`
+still measures ~40K TPS.
+
+## Run-to-run variance
+
+The earlier "treat ±10% as noise" guidance was too optimistic for
+Firebird's write path. Running the identical suite twice back to back:
+
+| | MariaDB / PostgreSQL | Firebird (any version) |
+|---|---|---|
+| reads | 0.99–1.03× | 0.91–1.27× |
+| writes | 0.98–1.00× | **0.37–1.42×** |
+
+MariaDB and PostgreSQL are reproducible to within a few percent. Firebird's
+`oltp_delete`, `oltp_update_*` and `oltp_read_only` moved by factors, not
+percentages — FB3's `oltp_delete` by 0.37×, FB5's `oltp_read_only` by 1.92×.
+Part of that is background garbage collection after a large table is
+dropped: FB5's first pass ran right after a 1M-row table was dropped and
+its reads were depressed ~2× until a second pass.
+
+Single-run Firebird write figures should not be quoted. Everything in this
+document is the second of two consecutive runs.
 
 ## What we fixed for fair comparison
 

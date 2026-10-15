@@ -1,0 +1,439 @@
+========================================
+Sysbench Benchmark Suite
+Driver: firebird
+Tables: 4 x 10000 rows
+Threads: 4, Time: 10s
+Script start: Tue Jun 16 03:54:29 PM CEST 2026
+========================================
+Benchmarks start: Tue Jun 16 03:54:29 PM CEST 2026
+========================================
+
+--- oltp_point_select ---
+sysbench 1.1.0-844b13c (using bundled LuaJIT 2.1.0-beta3)
+
+Running the test with following options:
+Number of threads: 4
+Initializing random number generator from current time
+
+
+Initializing worker threads...
+
+WARNING: Firebird embedded mode detected ('localhost/3054:/var/lib/firebird4/sbtest.fdb' has no host: prefix).
+WARNING: The embedded engine needs more stack than sysbench's default 64K — run with --thread-stack-size=2M or larger, otherwise worker threads will segfault inside libEngine*.so during attachDatabase.
+Threads started!
+
+SQL statistics:
+    queries performed:
+        read:                            148871
+        write:                           0
+        other:                           0
+        total:                           148871
+    transactions:                        148871 (14824.38 per sec.)
+    queries:                             148871 (14824.38 per sec.)
+    ignored errors:                      0      (0.00 per sec.)
+    reconnects:                          0      (0.00 per sec.)
+
+Throughput:
+    events/s (eps):                      14824.3818
+    time elapsed:                        10.0423s
+    total number of events:              148871
+
+Latency (ms):
+         min:                                    0.07
+         avg:                                    0.27
+         max:                                    5.95
+         95th percentile:                        0.34
+         sum:                                39921.71
+
+Threads fairness:
+    events (avg/stddev):           37217.7500/61.50
+    execution time (avg/stddev):   9.9804/0.00
+
+
+--- oltp_read_only ---
+sysbench 1.1.0-844b13c (using bundled LuaJIT 2.1.0-beta3)
+
+Running the test with following options:
+Number of threads: 4
+Initializing random number generator from current time
+
+
+Initializing worker threads...
+
+WARNING: Firebird embedded mode detected ('localhost/3054:/var/lib/firebird4/sbtest.fdb' has no host: prefix).
+WARNING: The embedded engine needs more stack than sysbench's default 64K — run with --thread-stack-size=2M or larger, otherwise worker threads will segfault inside libEngine*.so during attachDatabase.
+Threads started!
+
+SQL statistics:
+    queries performed:
+        read:                            82208
+        write:                           0
+        other:                           11744
+        total:                           93952
+    transactions:                        5872   (586.19 per sec.)
+    queries:                             93952  (9379.11 per sec.)
+    ignored errors:                      0      (0.00 per sec.)
+    reconnects:                          0      (0.00 per sec.)
+
+Throughput:
+    events/s (eps):                      586.1945
+    time elapsed:                        10.0172s
+    total number of events:              5872
+
+Latency (ms):
+         min:                                    5.27
+         avg:                                    6.81
+         max:                                   25.26
+         95th percentile:                        8.90
+         sum:                                39997.31
+
+Threads fairness:
+    events (avg/stddev):           1468.0000/1.22
+    execution time (avg/stddev):   9.9993/0.00
+
+
+--- oltp_read_write ---
+sysbench 1.1.0-844b13c (using bundled LuaJIT 2.1.0-beta3)
+
+Running the test with following options:
+Number of threads: 4
+Initializing random number generator from current time
+
+
+Initializing worker threads...
+
+WARNING: Firebird embedded mode detected ('localhost/3054:/var/lib/firebird4/sbtest.fdb' has no host: prefix).
+WARNING: The embedded engine needs more stack than sysbench's default 64K — run with --thread-stack-size=2M or larger, otherwise worker threads will segfault inside libEngine*.so during attachDatabase.
+Threads started!
+
+SQL statistics:
+    queries performed:
+        read:                            7280
+        write:                           2080
+        other:                           1040
+        total:                           10400
+    transactions:                        520    (51.44 per sec.)
+    queries:                             10400  (1028.74 per sec.)
+    ignored errors:                      0      (0.00 per sec.)
+    reconnects:                          0      (0.00 per sec.)
+
+Throughput:
+    events/s (eps):                      51.4368
+    time elapsed:                        10.1095s
+    total number of events:              520
+
+Latency (ms):
+         min:                                   37.11
+         avg:                                   77.48
+         max:                                  219.58
+         95th percentile:                      127.81
+         sum:                                40288.39
+
+Threads fairness:
+    events (avg/stddev):           130.0000/0.71
+    execution time (avg/stddev):   10.0721/0.01
+
+
+--- oltp_insert ---
+sysbench 1.1.0-844b13c (using bundled LuaJIT 2.1.0-beta3)
+
+Running the test with following options:
+Number of threads: 4
+Initializing random number generator from current time
+
+
+Initializing worker threads...
+
+WARNING: Firebird embedded mode detected ('localhost/3054:/var/lib/firebird4/sbtest.fdb' has no host: prefix).
+WARNING: The embedded engine needs more stack than sysbench's default 64K — run with --thread-stack-size=2M or larger, otherwise worker threads will segfault inside libEngine*.so during attachDatabase.
+Threads started!
+
+SQL statistics:
+    queries performed:
+        read:                            0
+        write:                           64052
+        other:                           0
+        total:                           64052
+    transactions:                        64052  (4306.93 per sec.)
+    queries:                             64052  (4306.93 per sec.)
+    ignored errors:                      0      (0.00 per sec.)
+    reconnects:                          0      (0.00 per sec.)
+
+Throughput:
+    events/s (eps):                      4306.9259
+    time elapsed:                        14.8719s
+    total number of events:              64052
+
+Latency (ms):
+         min:                                    0.00
+         avg:                                    0.62
+         max:                                   33.42
+         95th percentile:                        1.12
+         sum:                                39902.83
+
+Threads fairness:
+    events (avg/stddev):           16013.0000/376.21
+    execution time (avg/stddev):   9.9757/0.00
+
+
+--- oltp_delete ---
+sysbench 1.1.0-844b13c (using bundled LuaJIT 2.1.0-beta3)
+
+Running the test with following options:
+Number of threads: 4
+Initializing random number generator from current time
+
+
+Initializing worker threads...
+
+WARNING: Firebird embedded mode detected ('localhost/3054:/var/lib/firebird4/sbtest.fdb' has no host: prefix).
+WARNING: The embedded engine needs more stack than sysbench's default 64K — run with --thread-stack-size=2M or larger, otherwise worker threads will segfault inside libEngine*.so during attachDatabase.
+Threads started!
+
+SQL statistics:
+    queries performed:
+        read:                            0
+        write:                           2415
+        other:                           0
+        total:                           2415
+    transactions:                        2415   (238.57 per sec.)
+    queries:                             2415   (238.57 per sec.)
+    ignored errors:                      0      (0.00 per sec.)
+    reconnects:                          0      (0.00 per sec.)
+
+Throughput:
+    events/s (eps):                      238.5739
+    time elapsed:                        10.1227s
+    total number of events:              2415
+
+Latency (ms):
+         min:                                    4.85
+         avg:                                   16.58
+         max:                                   38.06
+         95th percentile:                       23.10
+         sum:                                40045.79
+
+Threads fairness:
+    events (avg/stddev):           603.7500/1.09
+    execution time (avg/stddev):   10.0114/0.00
+
+
+--- oltp_update_index ---
+sysbench 1.1.0-844b13c (using bundled LuaJIT 2.1.0-beta3)
+
+Running the test with following options:
+Number of threads: 4
+Initializing random number generator from current time
+
+
+Initializing worker threads...
+
+WARNING: Firebird embedded mode detected ('localhost/3054:/var/lib/firebird4/sbtest.fdb' has no host: prefix).
+WARNING: The embedded engine needs more stack than sysbench's default 64K — run with --thread-stack-size=2M or larger, otherwise worker threads will segfault inside libEngine*.so during attachDatabase.
+Threads started!
+
+SQL statistics:
+    queries performed:
+        read:                            0
+        write:                           1681
+        other:                           0
+        total:                           1681
+    transactions:                        1681   (165.62 per sec.)
+    queries:                             1681   (165.62 per sec.)
+    ignored errors:                      0      (0.00 per sec.)
+    reconnects:                          0      (0.00 per sec.)
+
+Throughput:
+    events/s (eps):                      165.6208
+    time elapsed:                        10.1497s
+    total number of events:              1681
+
+Latency (ms):
+         min:                                   10.80
+         avg:                                   23.83
+         max:                                   52.44
+         95th percentile:                       33.12
+         sum:                                40050.57
+
+Threads fairness:
+    events (avg/stddev):           420.2500/2.95
+    execution time (avg/stddev):   10.0126/0.01
+
+
+--- oltp_update_non_index ---
+sysbench 1.1.0-844b13c (using bundled LuaJIT 2.1.0-beta3)
+
+Running the test with following options:
+Number of threads: 4
+Initializing random number generator from current time
+
+
+Initializing worker threads...
+
+WARNING: Firebird embedded mode detected ('localhost/3054:/var/lib/firebird4/sbtest.fdb' has no host: prefix).
+WARNING: The embedded engine needs more stack than sysbench's default 64K — run with --thread-stack-size=2M or larger, otherwise worker threads will segfault inside libEngine*.so during attachDatabase.
+Threads started!
+
+SQL statistics:
+    queries performed:
+        read:                            0
+        write:                           2603
+        other:                           0
+        total:                           2603
+    transactions:                        2603   (259.67 per sec.)
+    queries:                             2603   (259.67 per sec.)
+    ignored errors:                      0      (0.00 per sec.)
+    reconnects:                          0      (0.00 per sec.)
+
+Throughput:
+    events/s (eps):                      259.6729
+    time elapsed:                        10.0241s
+    total number of events:              2603
+
+Latency (ms):
+         min:                                    5.90
+         avg:                                   15.37
+         max:                                   28.57
+         95th percentile:                       21.11
+         sum:                                40019.68
+
+Threads fairness:
+    events (avg/stddev):           650.7500/0.43
+    execution time (avg/stddev):   10.0049/0.00
+
+
+--- select_random_points ---
+sysbench 1.1.0-844b13c (using bundled LuaJIT 2.1.0-beta3)
+
+Running the test with following options:
+Number of threads: 4
+Initializing random number generator from current time
+
+
+Initializing worker threads...
+
+WARNING: Firebird embedded mode detected ('localhost/3054:/var/lib/firebird4/sbtest.fdb' has no host: prefix).
+WARNING: The embedded engine needs more stack than sysbench's default 64K — run with --thread-stack-size=2M or larger, otherwise worker threads will segfault inside libEngine*.so during attachDatabase.
+Threads started!
+
+SQL statistics:
+    queries performed:
+        read:                            118334
+        write:                           0
+        other:                           0
+        total:                           118334
+    transactions:                        118334 (11818.64 per sec.)
+    queries:                             118334 (11818.64 per sec.)
+    ignored errors:                      0      (0.00 per sec.)
+    reconnects:                          0      (0.00 per sec.)
+
+Throughput:
+    events/s (eps):                      11818.6372
+    time elapsed:                        10.0125s
+    total number of events:              118334
+
+Latency (ms):
+         min:                                    0.13
+         avg:                                    0.34
+         max:                                   17.38
+         95th percentile:                        0.48
+         sum:                                39897.24
+
+Threads fairness:
+    events (avg/stddev):           29583.5000/668.92
+    execution time (avg/stddev):   9.9743/0.00
+
+
+--- select_random_ranges ---
+sysbench 1.1.0-844b13c (using bundled LuaJIT 2.1.0-beta3)
+
+Running the test with following options:
+Number of threads: 4
+Initializing random number generator from current time
+
+
+Initializing worker threads...
+
+WARNING: Firebird embedded mode detected ('localhost/3054:/var/lib/firebird4/sbtest.fdb' has no host: prefix).
+WARNING: The embedded engine needs more stack than sysbench's default 64K — run with --thread-stack-size=2M or larger, otherwise worker threads will segfault inside libEngine*.so during attachDatabase.
+Threads started!
+
+SQL statistics:
+    queries performed:
+        read:                            127275
+        write:                           0
+        other:                           0
+        total:                           127275
+    transactions:                        127275 (12702.44 per sec.)
+    queries:                             127275 (12702.44 per sec.)
+    ignored errors:                      0      (0.00 per sec.)
+    reconnects:                          0      (0.00 per sec.)
+
+Throughput:
+    events/s (eps):                      12702.4414
+    time elapsed:                        10.0197s
+    total number of events:              127275
+
+Latency (ms):
+         min:                                    0.15
+         avg:                                    0.31
+         max:                                    6.08
+         95th percentile:                        0.43
+         sum:                                39894.57
+
+Threads fairness:
+    events (avg/stddev):           31818.7500/910.35
+    execution time (avg/stddev):   9.9736/0.00
+
+
+--- bulk_insert ---
+sysbench 1.1.0-844b13c (using bundled LuaJIT 2.1.0-beta3)
+
+Running the test with following options:
+Number of threads: 4
+Initializing random number generator from current time
+
+
+Initializing worker threads...
+
+WARNING: Firebird embedded mode detected ('localhost/3054:/var/lib/firebird4/sbtest.fdb' has no host: prefix).
+WARNING: The embedded engine needs more stack than sysbench's default 64K — run with --thread-stack-size=2M or larger, otherwise worker threads will segfault inside libEngine*.so during attachDatabase.
+Threads started!
+
+SQL statistics:
+    queries performed:
+        read:                            0
+        write:                           10000
+        other:                           10
+        total:                           10010
+    transactions:                        10000  (41746.99 per sec.)
+    queries:                             10010  (41788.74 per sec.)
+    ignored errors:                      0      (0.00 per sec.)
+    reconnects:                          0      (0.00 per sec.)
+
+Throughput:
+    events/s (eps):                      41746.9928
+    time elapsed:                        0.2395s
+    total number of events:              10000
+
+Latency (ms):
+         min:                                    0.00
+         avg:                                    0.09
+         max:                                  114.69
+         95th percentile:                        0.00
+         sum:                                  881.48
+
+Threads fairness:
+    events (avg/stddev):           2500.0000/500.00
+    execution time (avg/stddev):   0.2204/0.00
+
+
+========================================
+Script start:     2026-06-16 15:54:29
+Benchmarks start: 2026-06-16 15:54:29
+Script end:       2026-06-16 15:56:58
+Prep time:        0s
+Benchmark time:   149s
+Total time:       149s
+Results saved to: benchmark_firebird_20260616_155429.txt
+========================================

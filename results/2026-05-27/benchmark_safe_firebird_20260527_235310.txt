@@ -1,0 +1,188 @@
+========================================
+Sysbench Read/Safe Benchmark Suite
+Driver: firebird
+Tables: 4 x 10000 rows
+Threads: 4, Time: 10s
+Script start: Wed May 27 11:53:10 PM CEST 2026
+========================================
+Preparing tables...
+sysbench 1.1.0-3ceba0b (using bundled LuaJIT 2.1.0-beta3)
+
+Creating table 'sbtest1'...
+Inserting 10000 records into 'sbtest1'
+Creating a secondary index on 'sbtest1'...
+Creating table 'sbtest2'...
+Inserting 10000 records into 'sbtest2'
+Creating a secondary index on 'sbtest2'...
+Creating table 'sbtest3'...
+Inserting 10000 records into 'sbtest3'
+Creating a secondary index on 'sbtest3'...
+Creating table 'sbtest4'...
+Inserting 10000 records into 'sbtest4'
+Creating a secondary index on 'sbtest4'...
+
+Benchmarks start: Wed May 27 11:53:42 PM CEST 2026
+========================================
+
+--- oltp_point_select ---
+sysbench 1.1.0-3ceba0b (using bundled LuaJIT 2.1.0-beta3)
+
+Running the test with following options:
+Number of threads: 4
+Initializing random number generator from current time
+
+
+Initializing worker threads...
+
+Threads started!
+
+FATAL: isc_dsql_execute() failed: SQLCODE -502 SQL error code = -502
+(last message repeated 1 times)
+FATAL: failed query was: SELECT c FROM sbtest2 WHERE id=?
+(last message repeated 1 times)
+FATAL: isc_dsql_execute() failed: SQLCODE -502 SQL error code = -502
+FATAL: failed query was: SELECT c FROM sbtest1 WHERE id=?
+FATAL: `thread_run' function failed: ./src/lua/oltp_common.lua:433: SQL error, errno = -502, state = '00502': SQL error code = -502
+(last message repeated 2 times)
+FATAL: isc_dsql_execute() failed: SQLCODE -502 SQL error code = -502
+FATAL: failed query was: SELECT c FROM sbtest2 WHERE id=?
+FATAL: `thread_run' function failed: ./src/lua/oltp_common.lua:433: SQL error, errno = -502, state = '00502': SQL error code = -502
+
+--- oltp_read_only ---
+sysbench 1.1.0-3ceba0b (using bundled LuaJIT 2.1.0-beta3)
+
+Running the test with following options:
+Number of threads: 4
+Initializing random number generator from current time
+
+
+Initializing worker threads...
+
+Threads started!
+
+FATAL: isc_dsql_execute() failed: SQLCODE -502 SQL error code = -502
+(last message repeated 1 times)
+FATAL: isc_dsql_execute() failed: SQLCODE -502 SQL error code = -502
+FATAL: failed query was: SELECT c FROM sbtest2 WHERE id=?
+FATAL: failed query was: SELECT c FROM sbtest4 WHERE id=?
+FATAL: `thread_run' function failed: ./src/lua/oltp_common.lua:433: SQL error, errno = -502, state = '00502': SQL error code = -502
+(last message repeated 1 times)
+FATAL: failed query was: SELECT c FROM sbtest2 WHERE id=?
+FATAL: isc_dsql_execute() failed: SQLCODE -502 SQL error code = -502
+FATAL: failed query was: SELECT c FROM sbtest2 WHERE id=?
+FATAL: `thread_run' function failed: ./src/lua/oltp_common.lua:433: SQL error, errno = -502, state = '00502': SQL error code = -502
+FATAL: `thread_run' function failed: ./src/lua/oltp_common.lua:433: SQL error, errno = -502, state = '00502': SQL error code = -502
+
+--- oltp_read_write ---
+sysbench 1.1.0-3ceba0b (using bundled LuaJIT 2.1.0-beta3)
+
+Running the test with following options:
+Number of threads: 4
+Initializing random number generator from current time
+
+
+Initializing worker threads...
+
+Threads started!
+
+FATAL: isc_dsql_execute() failed: SQLCODE -502 SQL error code = -502
+FATAL: failed query was: SELECT c FROM sbtest2 WHERE id=?
+FATAL: isc_dsql_execute() failed: SQLCODE -502 SQL error code = -502
+FATAL: failed query was: SELECT c FROM sbtest2 WHERE id=?
+FATAL: `thread_run' function failed: ./src/lua/oltp_common.lua:433: SQL error, errno = -502, state = '00502': SQL error code = -502
+(last message repeated 1 times)
+FATAL: isc_dsql_execute() failed: SQLCODE -502 SQL error code = -502
+FATAL: failed query was: SELECT c FROM sbtest2 WHERE id=?
+FATAL: isc_dsql_execute() failed: SQLCODE -502 SQL error code = -502
+FATAL: failed query was: SELECT c FROM sbtest4 WHERE id=?
+FATAL: `thread_run' function failed: ./src/lua/oltp_common.lua:433: SQL error, errno = -502, state = '00502': SQL error code = -502
+
+--- oltp_update_index ---
+sysbench 1.1.0-3ceba0b (using bundled LuaJIT 2.1.0-beta3)
+
+Running the test with following options:
+Number of threads: 4
+Initializing random number generator from current time
+
+
+Initializing worker threads...
+
+Threads started!
+
+SQL statistics:
+    queries performed:
+        read:                            0
+        write:                           619
+        other:                           0
+        total:                           619
+    transactions:                        619    (61.42 per sec.)
+    queries:                             619    (61.42 per sec.)
+    ignored errors:                      1      (0.10 per sec.)
+    reconnects:                          0      (0.00 per sec.)
+
+Throughput:
+    events/s (eps):                      61.4227
+    time elapsed:                        10.0777s
+    total number of events:              619
+
+Latency (ms):
+         min:                                    0.11
+         avg:                                   64.83
+         max:                                10003.07
+         95th percentile:                        0.41
+         sum:                                40132.59
+
+Threads fairness:
+    events (avg/stddev):           154.7500/40.23
+    execution time (avg/stddev):   10.0331/0.00
+
+
+--- oltp_update_non_index ---
+sysbench 1.1.0-3ceba0b (using bundled LuaJIT 2.1.0-beta3)
+
+Running the test with following options:
+Number of threads: 4
+Initializing random number generator from current time
+
+
+Initializing worker threads...
+
+Threads started!
+
+SQL statistics:
+    queries performed:
+        read:                            0
+        write:                           480
+        other:                           0
+        total:                           480
+    transactions:                        480    (47.66 per sec.)
+    queries:                             480    (47.66 per sec.)
+    ignored errors:                      1      (0.10 per sec.)
+    reconnects:                          0      (0.00 per sec.)
+
+Throughput:
+    events/s (eps):                      47.6608
+    time elapsed:                        10.0712s
+    total number of events:              480
+
+Latency (ms):
+         min:                                    0.11
+         avg:                                   83.49
+         max:                                10003.34
+         95th percentile:                        0.40
+         sum:                                40077.37
+
+Threads fairness:
+    events (avg/stddev):           120.0000/83.69
+    execution time (avg/stddev):   10.0193/0.00
+
+
+========================================
+Script start:     2026-05-27 23:53:10
+Benchmarks start: 2026-05-27 23:53:42
+Script end:       2026-05-27 23:54:04
+Prep time:        32s
+Benchmark time:   22s
+Total time:       54s
+Results saved to: benchmark_safe_firebird_20260527_235310.txt
+========================================

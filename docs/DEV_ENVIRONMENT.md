@@ -108,9 +108,16 @@ After installation:
 # Start server
 sudo /opt/firebird/bin/fbguard -daemon -forever
 
-# Create test database
-isql -user SYSDBA -password masterkey <<< "CREATE DATABASE 'localhost:/tmp/sbtest.fdb' USER 'SYSDBA' PASSWORD 'masterkey' DEFAULT CHARACTER SET UTF8; QUIT;"
+# Create test database — on disk, not on tmpfs (/tmp), so the comparison
+# against MariaDB/PostgreSQL stays fair
+isql -user SYSDBA -password masterkey <<< "CREATE DATABASE 'localhost:/var/lib/firebird/sbtest.fdb' USER 'SYSDBA' PASSWORD 'masterkey' DEFAULT CHARACTER SET UTF8; QUIT;"
 ```
+
+Firebird 4 and 6 are installed alongside FB5 under `/opt/firebird4` and
+`/opt/firebird6`, on ports 3054 and 3056, with data in
+`/var/lib/firebird4` and `/var/lib/firebird6`. See
+[docs/BUILDING_FIREBIRD.md](BUILDING_FIREBIRD.md) for running them
+side by side.
 
 ## Tool Versions (as of 2026-05-27)
 
@@ -129,6 +136,7 @@ isql -user SYSDBA -password masterkey <<< "CREATE DATABASE 'localhost:/tmp/sbtes
 | gh | 2.92.0 |
 | MariaDB | 11.8.6 |
 | PostgreSQL | 17.10 |
+| Firebird 6 | 6.0.0.2012 (trunk, "Initial", added 2026-06-16) |
 | Firebird 5 | 5.0.4 |
 | Firebird 4 | 4.0.7 |
-| Firebird 3 | 3.0.14 |
+| Firebird 3 | 3.0.14 (only usable from the `firebird-isc` branch) |

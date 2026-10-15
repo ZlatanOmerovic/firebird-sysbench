@@ -11,16 +11,23 @@
 
 | Firebird | Build | Port | Notes |
 |---|---|---|---|
-| 4.0.7 | release | 3054 | gcc 14 |
+| 3.0.14 | release | 3057 | gcc 14, driven by the FB5 client |
+| 4.0.7 | release | 3055 | gcc 14 |
 | 5.0.4 | release | 3050 | gcc 14 |
 | 6.0.0.2012 | Trunk / Initial | 3056 | gcc 14, master branch HEAD |
 
-### Firebird 3 is excluded
+Ports differ from earlier rounds: 3053 and 3054 were occupied by unrelated
+Firebird servers on the Windows host, visible inside WSL2 through mirrored
+networking. Identify a server by attaching and reading
+`rdb$get_context('SYSTEM','ENGINE_VERSION')`, not by reading `ss` output.
 
-FB3's libfbclient.so doesn't ship `fb_c_api.h` (the C wrapper was introduced
-in FB5) and uses an older OO API vtable layout incompatible with our
-driver's compile-time ABI. Attempting to attach via FB3's runtime client
-produces:
+### Firebird 3 — server works, client library does not
+
+Earlier rounds excluded FB3 entirely. That was too broad: the restriction is
+on the **client library**, not the server.
+
+Loading FB3's `libfbclient.so` is refused at startup, because its OO API
+vtable predates methods this driver dispatches through:
 
 ```
 FATAL: Firebird client library is too old for this driver (IUtil vtable v2).
@@ -28,6 +35,12 @@ FATAL: Firebird client library is too old for this driver (IUtil vtable v2).
        For Firebird 3 support, use the `firebird-isc` branch which uses
        the legacy ISC API.
 ```
+
+An FB3 **server** driven by the FB5 client is a different matter, and works:
+it attaches, prepares, and runs the full suite. FB3 is therefore included in
+the tables below, with one structural difference — the Batch API is a
+Firebird 4+ server feature, so bulk loading falls back to single-row inserts.
+That shows up directly in `bulk_insert`: 5,614 TPS against 39–45K for FB4/5/6.
 
 ## Prepare phase — 4 tables × 1,000,000 rows (Batch API)
 
@@ -41,18 +54,30 @@ FB6 master shows a notable regression on the Batch API path.
 
 ## TABLE_SIZE=10K (sysbench default), 4 threads, TPS
 
-| Benchmark | FB 4.0.7 | FB 5.0.4 | FB 6.0.0.2012 |
-|---|---|---|---|
-| oltp_point_select | 14,824 | **14,951** | 14,374 |
-| oltp_read_only | 586 | 570 | **582** |
-| oltp_read_write | 51 | 52 | **53** |
-| oltp_insert | **4,307** | 4,010 | 4,155 |
-| oltp_delete | 239 | **280** | 240 |
-| oltp_update_index | **166** | 132 | 119 |
-| oltp_update_non_index | **260** | 168 | 143 |
-| select_random_points | 11,819 | **12,114** | 11,603 |
-| select_random_ranges | 12,702 | **13,090** | 11,013 |
-| bulk_insert | **41,747** | 39,710 | 39,353 |
+| Benchmark | FB 3.0.14 | FB 4.0.7 | FB 5.0.4 | FB 6.0.0.2012 |
+|---|---|---|---|---|
+| oltp_point_select | 14,080 | 15,233 | 14,510 | **15,331** |
+| oltp_read_only | 522 | 549 | 535 | **563** |
+| oltp_read_write | 54 | 54 | 55 | **59** |
+| oltp_insert | 148 | 147 | **153** | 149 |
+| oltp_delete | 56 | **286** | 66 | 94 |
+| oltp_update_index | 137 | **139** | 55 | 48 |
+| oltp_update_non_index | 181 | **189** | 51 | 62 |
+| select_random_points | **11,795** | 11,512 | 11,021 | 11,752 |
+| select_random_ranges | **12,033** | 11,916 | 11,810 | 10,984 |
+| bulk_insert | 5,614 | **46,285** | 39,585 | 45,086 |
+
+Measured 2026-10-14, second of two consecutive runs, after the
+`query()`-insert batching fix. `oltp_insert` was previously inflated ~27×
+across every version by that path — see *Correction* in
+`BENCHMARK_RESULTS.md`.
+
+**The write rows do not support version rankings.** Repeating this suite
+back to back moved `oltp_delete` and `oltp_update_*` by 0.37–1.42× on the
+same engine and build. FB3's `oltp_delete` is the clearest case: 149 TPS in
+the first pass, 56 in the second. Only `bulk_insert` (FB3's single-row
+fallback) and the read benchmarks are stable enough to compare across
+versions here.
 
 At 10K the dataset fits in cache. Differences are mostly noise; the
 notable signal is that **FB4 is fastest on the update/delete benchmarks**
@@ -60,6 +85,12 @@ notable signal is that **FB4 is fastest on the update/delete benchmarks**
 introduced after FB4.
 
 ## TABLE_SIZE=1M, scaling 1 → 2 → 4 threads, TPS
+
+> **Not re-measured.** The figures in this section predate the
+> `query()`-insert batching fix and have not been repeated at 1M rows. The
+> read rows are unaffected by that fix, but were single runs, and Firebird's
+> write rows carry the run-to-run variance described above.
+
 
 | Benchmark | FB | 1t | 2t | 4t |
 |---|---|---|---|---|
