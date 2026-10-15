@@ -32,21 +32,35 @@ Single-run measurements. Variance not characterised; treat ±10% as noise.
 
 | Benchmark | MariaDB 11.8 | PostgreSQL 17.10 | Firebird 6.0.0.2012 |
 |---|---:|---:|---:|
-| oltp_point_select | **56,498** | 42,731 | 14,831 |
-| oltp_read_only | **2,533** | 2,252 | 617 |
-| oltp_read_write | **814** | 733 | 50 |
-| oltp_insert | 822 | 938 | **5,047** |
-| oltp_delete | **1,003** | 942 | 90 |
-| oltp_update_index | **834** | 805 | 50 |
-| oltp_update_non_index | **879** | 874 | 98 |
-| select_random_points | 27,838 | **32,137** | 11,890 |
-| select_random_ranges | **25,940** | 24,498 | 11,685 |
-| bulk_insert | 166,314 | **343,105** | 39,086 |
+| oltp_point_select | **60,164** | 44,451 | 15,331 |
+| oltp_read_only | **2,591** | 2,293 | 563 |
+| oltp_read_write | **891** | 762 | 59 |
+| oltp_insert | **1,149** | 1,117 | 149 |
+| oltp_delete | **1,368** | 1,311 | 94 |
+| oltp_update_index | **1,175** | 1,132 | 48 |
+| oltp_update_non_index | **1,168** | 1,140 | 62 |
+| select_random_points | 28,330 | **33,051** | 11,752 |
+| select_random_ranges | **25,378** | 24,423 | 10,984 |
+| bulk_insert | 162,575 | **230,866** | 45,086 |
 
-Same `oltp_insert` story as FB5: Firebird's OO API path is genuinely
-fast on small in-cache inserts.
+Measured 2026-10-14, second of two consecutive runs. See the *Correction*
+and *Run-to-run variance* sections of `BENCHMARK_RESULTS.md`.
+
+The `oltp_insert` figure previously reported here (5,047 TPS, described as
+Firebird's OO API path being "genuinely fast") was an artifact of the driver
+batching `query()` inserts. With that fixed, FB6 measures 149 TPS against
+MariaDB's 1,149 — roughly 7.7× slower, in line with FB3/FB4/FB5. See the
+*Correction* section of `BENCHMARK_RESULTS.md`.
 
 ## TABLE_SIZE=1M, scaling 1 → 2 → 4 threads, TPS
+
+> **Not re-measured.** The figures in this section predate the
+> `query()`-insert batching fix and have not been repeated at 1M rows. The
+> `oltp_insert` rows are invalid — Firebird's values there were produced by
+> the Batch API path and are inflated by roughly an order of magnitude. The
+> read rows are unaffected by that fix, but were single runs, and Firebird's
+> write rows carry the run-to-run variance described above.
+
 
 | Benchmark | DB | 1t | 2t | 4t |
 |---|---|---:|---:|---:|
@@ -92,15 +106,15 @@ as a worst-case rather than typical.
 
 ### Where FB6 wins
 
-- **`oltp_insert` @ 10K**: 5,047 TPS — **5× faster** than MariaDB
-  (822) and PostgreSQL (938). The genuine engine advantage on small
-  in-cache prepared inserts holds.
 - **`select_random_points` @ 1-2 threads (1M)**: 2,581 / 5,184 — better
   than MariaDB (579 / 1,403), competitive with PostgreSQL (5,068 /
   10,869).
 
 ### Where FB6 loses
 
+- **`oltp_insert` @ 10K**: 149 TPS against MariaDB's 1,149 and
+  PostgreSQL's 1,117 — roughly **7.7× slower**. This row previously
+  claimed the opposite; see the correction note above the 10K table.
 - **Pure in-cache reads (10K)**: MariaDB/PostgreSQL dominate (~3-4×).
   Firebird's cursor open/close protocol overhead is real and isn't
   fixable from the driver layer.
@@ -115,8 +129,9 @@ as a worst-case rather than typical.
 
 Compared to FB5 (see `BENCHMARK_RESULTS.md`):
 
-- FB6 keeps the `oltp_insert` advantage and improves it (3,687 →
-  5,047).
+- `oltp_insert` is now within noise of FB5 (153 vs 149). The earlier
+  claim that FB6 "keeps and improves the advantage" (3,687 → 5,047)
+  described the Batch API path, not the engine.
 - FB6 regresses on write workloads compared to FB5 at 4 threads.
 - FB6 reads at 1M (in this run) are about half of FB5 — but the
   fresh-prep first-pass FB6 numbers showed FB6 ahead of FB5 on most

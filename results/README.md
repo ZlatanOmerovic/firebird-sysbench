@@ -8,7 +8,8 @@ root. Directories are named after the date in the filenames.
 |---|---|---|
 | `2026-05-27` | 12 | First measurements — **superseded** |
 | `2026-05-28` | 15 | Second measurements — **superseded** |
-| `2026-06-16` | 18 | The published round |
+| `2026-06-16` | 18 | Superseded — `oltp_insert` measured the Batch API |
+| `2026-10-14` | 12 | The published round |
 
 ## Two caveats before quoting anything here
 
@@ -64,3 +65,44 @@ PostgreSQL's:
 
 They are kept as a record of what those fixes changed — see "What we fixed
 for fair comparison" in `BENCHMARK_RESULTS.md`.
+
+
+## 2026-10-14 — the current round
+
+Twelve files: two consecutive passes over six engines. **Published figures
+come from the second pass**; the first is kept because the difference between
+them is itself a finding.
+
+| Engine | Port | Pass 1 | Pass 2 (published) |
+|---|---|---|---|
+| Firebird 5.0.4 | 3050 | `115434` | `123307` |
+| Firebird 4.0.7 | 3055 | `115710` | `123557` |
+| Firebird 6.0.0.2012 | 3056 | `115928` | `123812` |
+| Firebird 3.0.14 | 3057 | `120147` | `124039` |
+| MariaDB 11.8.6 | 3306 | `120712` | `124555` |
+| PostgreSQL 17.10 | 5432 | `120852` | `124736` |
+
+Unlike the earlier rounds, these files identify themselves: each header
+records the connection string (password redacted) and the resolved
+`libfbclient` path, so no attribution has to be reconstructed.
+
+Three things worth knowing about this round:
+
+- **It is the first round measured after the `query()`-insert batching fix.**
+  Earlier `oltp_insert` figures for Firebird were produced by the OO API
+  Batch API path and are inflated by roughly an order of magnitude.
+- **Firebird 3 is included for the first time**, driven by the FB5 client on
+  port 3057. Its `bulk_insert` figure reflects single-row fallback, since the
+  Batch API needs a Firebird 4+ server.
+- **Pass 1 of FB5 (`115434`) is depressed on reads** — `oltp_point_select`
+  11,458 vs 14,510 in pass 2, `oltp_read_only` 278 vs 535. Background
+  garbage collection from a 1M-row table dropped shortly before. It is kept
+  as evidence for the variance caveat in `BENCHMARK_RESULTS.md`.
+- **One run failed and was retried**: FB6 `select_random_ranges` in pass 1
+  hit `Invalid clumplet buffer structure` during attach and recorded zero.
+  It did not reproduce in three subsequent runs (10,860 / 10,780 / 10,564
+  TPS) and pass 2 recorded 10,984.
+
+Ports 3053 and 3054 are **not** the local FB3/FB4 servers in this round —
+those were occupied by Firebird servers on the Windows host, visible through
+WSL2 mirrored networking. FB4 was moved to 3055 and FB3 to 3057.

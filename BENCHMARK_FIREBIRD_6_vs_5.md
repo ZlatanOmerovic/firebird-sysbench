@@ -27,22 +27,37 @@ master branch.
 
 | Benchmark | FB 5.0.4 | FB 6.0.0.2012 | Change |
 |---|---|---|---|
-| oltp_point_select | 14,951 | 14,374 | -4% |
-| oltp_read_only | 570 | 582 | +2% |
-| oltp_read_write | 52 | 53 | +2% |
-| oltp_insert | 4,010 | 4,155 | +4% |
-| oltp_delete | 280 | 240 | -14% |
-| oltp_update_index | 132 | 119 | -10% |
-| oltp_update_non_index | 168 | 143 | -15% |
-| select_random_points | 12,114 | 11,603 | -4% |
-| select_random_ranges | 13,090 | 11,013 | -16% |
-| bulk_insert | 39,710 | 39,353 | -1% |
+| oltp_point_select | 14,510 | 15,331 | +6% |
+| oltp_read_only | 535 | 563 | +5% |
+| oltp_read_write | 55 | 59 | +7% |
+| oltp_insert | 153 | 149 | -3% |
+| oltp_delete | 66 | 94 | +42% |
+| oltp_update_index | 55 | 48 | -13% |
+| oltp_update_non_index | 51 | 62 | +22% |
+| select_random_points | 11,021 | 11,752 | +7% |
+| select_random_ranges | 11,810 | 10,984 | -7% |
+| bulk_insert | 39,585 | 45,086 | +14% |
+
+Re-measured 2026-10-14 after the `query()`-insert batching fix; `oltp_insert`
+for both versions was previously inflated ~27× by that path. Second of two
+consecutive runs.
+
+**Do not read the write rows as version differences.** Back-to-back repeats
+of this suite moved Firebird's `oltp_delete` and `oltp_update_*` by factors
+of 0.37–1.42×, which swamps every change in this table except possibly
+`bulk_insert`. See *Run-to-run variance* in `BENCHMARK_RESULTS.md`.
 
 At 10K the dataset fits in cache and contention dominates; differences here
 are mostly within noise except the ~10-16% drop on write-by-id and range
 scans.
 
 ## TABLE_SIZE=1M, scaling 1 → 2 → 4 threads
+
+> **Not re-measured.** The figures in this section predate the
+> `query()`-insert batching fix and have not been repeated at 1M rows. The
+> read rows are unaffected by that fix, but were single runs, and Firebird's
+> write rows carry the run-to-run variance described above.
+
 
 | Benchmark | FB | 1t | 2t | 4t |
 |---|---|---|---|---|
