@@ -198,7 +198,21 @@ FIREBIRD_DB=localhost/3054:/tmp/sbtest.fdb ./run_benchmarks.sh firebird
 
 # Custom parameters
 THREADS=8 TIME=30 TABLE_SIZE=100000 ./run_benchmarks.sh firebird
+
+# Unix sockets for MySQL/PostgreSQL and embedded Firebird instead of TCP
+TRANSPORT=local ./run_benchmarks.sh mysql
 ```
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `TRANSPORT` | `tcp` | `tcp`: every DBMS through TCP on the loopback (`MYSQL_HOST`, `PGSQL_HOST`, `FIREBIRD_HOST` default to `127.0.0.1`). `local`: MySQL through its Unix socket (`MYSQL_SOCKET`), PostgreSQL through its socket directory (`PGSQL_SOCKET_DIR`), Firebird embedded (`FIREBIRD_PATH`). Compare DBMS only with the same transport: the Unix socket alone gives MySQL about +25 %. |
+| `WARMUP` | `10` | Seconds of `--warmup-time` before each timed run |
+| `FIREBIRD_LINGER` | `60` | `ALTER DATABASE SET LINGER` value set once before the runs, so that the Firebird cache stays warm between sysbench processes |
+| `PREPARE_THREADS` | `1` | Threads for `prepare` |
+
+The results file starts with the transport, the warm-up and one line of
+server settings (version, cache, durability and, for Firebird, Forced
+Writes, LINGER and wire encryption).
 
 ## Documentation
 
