@@ -11,7 +11,11 @@ URL:           https://github.com/akopytov/sysbench/
 %if 0%{?rhel} < 7
 BuildRequires: mysql-devel
 %else
+%if 0%{?rhel} >= 9 || 0%{?fedora} >= 33
+BuildRequires: mariadb-connector-c-devel
+%else
 BuildRequires: mariadb-devel
+%endif
 %endif
 BuildRequires: postgresql-devel
 BuildRequires: make
@@ -20,10 +24,14 @@ BuildRequires: libtool
 BuildRequires: pkgconfig
 BuildRequires: libaio-devel
 # Use bundled cram for tests
+%if 0%{?rhel} >= 9 || 0%{?fedora} >= 31
+BuildRequires: python3
+%else
 %if 0%{?rhel} > 7
 BuildRequires: python2
 %else
 BuildRequires: python
+%endif
 %endif
 
 ExclusiveArch: %{arm} %{ix86} x86_64 %{mips} aarch64

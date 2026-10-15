@@ -88,7 +88,7 @@ jobs:
           dnf -y install --allowerasing \
             rpm-build gcc gcc-c++ make automake libtool pkgconfig \
             libaio-devel openssl-devel postgresql-devel libzstd-devel \
-            mariadb-connector-c-devel curl tar gzip git findutils
+            mariadb-connector-c-devel curl tar gzip git findutils python3
 
       - name: Install Firebird 5 headers
         run: |
