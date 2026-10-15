@@ -487,6 +487,15 @@ static int fb_autocommit_read(fb_conn_t *fbc, struct ITransaction *tra)
   return 0;
 }
 
+/* End the read transaction, if it is open. A transaction that has read a
+ * table keeps it "in use", so DDL on that table (DROP TABLE) would fail;
+ * BEGIN and DDL outside BEGIN end it first. It holds no changes. */
+static void fb_end_read_transaction(fb_conn_t *fbc)
+{
+  if (fbc->tra_read != NULL)
+    fb_commit(fbc, &fbc->tra_read);
+}
+
 /* The transaction that ends with a SELECT that ran in tra: the read
  * transaction with --firebird-autocommit-select, otherwise none. */
 static struct ITransaction **fb_read_end(fb_conn_t *fbc,
@@ -506,6 +515,8 @@ static struct ITransaction **fb_read_end(fb_conn_t *fbc,
  * NULL. */
 static int fb_execute_ddl(fb_conn_t *fbc, const char *sql)
 {
+  fb_end_read_transaction(fbc);
+
   for (unsigned attempt = 1; ; attempt++)
   {
     if (fb_ensure_transaction(fbc))
@@ -1455,8 +1466,9 @@ int firebird_drv_connect(db_conn_t *sb_conn)
 
   fbc->tra = NULL;
 
-  /* One line of server settings for each sysbench process. */
-  if (__sync_bool_compare_and_swap(&fb_settings_logged, 0, 1))
+  /* One line of server settings for each sysbench run. */
+  if (sb_globals.cmdname != NULL && strcmp(sb_globals.cmdname, "run") == 0 &&
+      __sync_bool_compare_and_swap(&fb_settings_logged, 0, 1))
     fb_log_server_settings(fbc);
 
   sb_conn->ptr = fbc;
@@ -2240,6 +2252,7 @@ static db_error_t fb_query(db_conn_t *sb_conn, const char *query,
 
     if (!is_commit && !is_rollback)
     {
+      fb_end_read_transaction(fbc);
       fbc->tra = fb_start_transaction(fbc, &fb_begin_tpb);
       if (fbc->tra == NULL)
       {
