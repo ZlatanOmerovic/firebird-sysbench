@@ -104,6 +104,7 @@ typedef struct
   unsigned char *out_buf;
   unsigned nparams;
   unsigned nfields;
+  unsigned stmt_type;  /* isc_info_sql_stmt_* from IStatement::getType() */
   char prepared;
   char cursor_open;
   struct IResultSet *cursor;
@@ -153,6 +154,9 @@ static db_error_t firebird_drv_query(db_conn_t *, const char *, size_t,
 static int firebird_drv_free_results(db_result_t *);
 static int firebird_drv_close(db_stmt_t *);
 static int firebird_drv_done(void);
+
+static db_error_t fb_query(db_conn_t *, const char *, db_result_t *,
+                           fb_stmt_t *);
 
 static db_driver_t firebird_driver =
 {
@@ -270,6 +274,77 @@ static int fb_ensure_transaction(fb_conn_t *fbc)
   }
 
   return 0;
+}
+
+static int fb_is_select(unsigned stmt_type)
+{
+  return stmt_type == isc_info_sql_stmt_select ||
+         stmt_type == isc_info_sql_stmt_select_for_upd;
+}
+
+static int fb_is_dml(unsigned stmt_type)
+{
+  return stmt_type == isc_info_sql_stmt_insert ||
+         stmt_type == isc_info_sql_stmt_update ||
+         stmt_type == isc_info_sql_stmt_delete;
+}
+
+/* Learn the type of an emulated prepared statement once: prepare the
+ * template and free it at once. Every later execution then sends the
+ * literal SQL text with one attachment-level call:
+ *  - a SELECT through IAttachment::openCursor; the engine knows the output
+ *    format, so none is passed;
+ *  - an INSERT, UPDATE or DELETE without RETURNING through
+ *    IAttachment::execute.
+ * Returns NULL for any other statement and when the describe fails; those
+ * keep the generic query() path, which reports any error at execution
+ * time. */
+static fb_stmt_t *fb_describe_template(fb_conn_t *fbc, const char *query)
+{
+  /* Do not leave a transaction behind: fb_query() commits implicit
+   * transactions only when it finds none open. */
+  int auto_txn = (fbc->tra == NULL);
+  if (auto_txn && fb_ensure_transaction(fbc))
+    return NULL;
+
+  IStatus_init(fbc->st);
+  struct IStatement *tmp_stmt = IAttachment_prepare(fbc->att, fbc->st,
+      fbc->tra, 0, query, FB_DIALECT, IStatement_PREPARE_PREFETCH_METADATA);
+  unsigned stmt_type = 0;
+  unsigned nfields = 0;
+  int described = 0;
+  if (!fb_check_status(fbc->st))
+  {
+    stmt_type = IStatement_getType(tmp_stmt, fbc->st);
+    struct IMessageMetadata *out_meta = IStatement_getOutputMetadata(tmp_stmt,
+                                                                      fbc->st);
+    if (out_meta != NULL)
+    {
+      nfields = IMessageMetadata_getCount(out_meta, fbc->st);
+      IMessageMetadata_release(out_meta);
+    }
+    described = (out_meta != NULL && !fb_check_status(fbc->st));
+    IStatement_free(tmp_stmt, fbc->st);
+  }
+
+  if (auto_txn)
+  {
+    struct IStatus *rst = IMaster_getStatus(fb_master);
+    ITransaction_commit(fbc->tra, rst);
+    IStatus_dispose(rst);
+    fbc->tra = NULL;
+  }
+  IStatus_init(fbc->st);
+
+  if (!described ||
+      !((fb_is_select(stmt_type) && nfields > 0) ||
+        (fb_is_dml(stmt_type) && nfields == 0)))
+    return NULL;
+
+  fb_stmt_t *desc = (fb_stmt_t *)calloc(1, sizeof(fb_stmt_t));
+  if (desc != NULL)
+    desc->stmt_type = stmt_type;
+  return desc;
 }
 
 static void fb_extract_column_fast(struct IMessageMetadata *meta,
@@ -464,6 +539,75 @@ static void fb_free_result(fb_result_t *fbrs)
   free(fbrs->strings);
   free(fbrs->values);
   free(fbrs);
+}
+
+/* Read every row of an open cursor into a new fb_result_t (*out).
+ * Returns 0 on success, 1 on a fetch error (status left in fbc->st) and
+ * -1 when memory runs out. The caller closes the cursor. */
+static int fb_fetch_all(fb_conn_t *fbc, struct IResultSet *curs,
+                        struct IMessageMetadata *out_meta, fb_result_t **out)
+{
+  unsigned nfields = IMessageMetadata_getCount(out_meta, fbc->st);
+  unsigned out_len = IMessageMetadata_getMessageLength(out_meta, fbc->st);
+  unsigned capacity = 64;
+  unsigned char *out_buf = (unsigned char *)calloc(1, out_len);
+  fb_result_t *fbrs = (fb_result_t *)calloc(1, sizeof(fb_result_t));
+  int rc = -1;
+
+  *out = NULL;
+  if (fbrs != NULL)
+    fbrs->values = (db_value_t *)calloc(capacity * nfields,
+                                        sizeof(db_value_t));
+
+  if (out_buf != NULL && fbrs != NULL && fbrs->values != NULL)
+  {
+    int frc;
+
+    rc = 0;
+    fbrs->nfields = nfields;
+    while ((frc = IResultSet_fetchNext(curs, fbc->st, out_buf))
+           == IStatus_RESULT_OK)
+    {
+      if (fbrs->nrows >= capacity)
+      {
+        capacity *= 2;
+        db_value_t *nv = realloc(fbrs->values,
+                                 capacity * nfields * sizeof(db_value_t));
+        if (nv == NULL) { rc = -1; break; }
+        fbrs->values = nv;
+      }
+      for (unsigned ci = 0; ci < nfields; ci++)
+      {
+        uint32_t col_len = 0;
+        char *s = fb_extract_column_alloc(out_meta, fbc->st, out_buf, ci,
+                                           &col_len);
+        fbrs->values[fbrs->nrows * nfields + ci].ptr = s;
+        fbrs->values[fbrs->nrows * nfields + ci].len = col_len;
+        fb_result_add_string(fbrs, s);
+      }
+      fbrs->nrows++;
+    }
+    if (rc == 0 && frc != IStatus_RESULT_NO_DATA)
+      rc = 1;
+  }
+
+  free(out_buf);
+  if (rc == 0)
+    *out = fbrs;
+  else
+    fb_free_result(fbrs);
+  return rc;
+}
+
+/* Close a cursor whatever state the connection is in. close() releases the
+ * interface only when it succeeds. */
+static void fb_close_cursor(struct IResultSet *curs)
+{
+  struct IStatus *rst = IMaster_getStatus(fb_master);
+  IResultSet_close(curs, rst);
+  if (fb_check_status(rst))
+    IResultSet_release(curs);
+  IStatus_dispose(rst);
 }
 
 
@@ -954,13 +1098,18 @@ int firebird_drv_prepare(db_stmt_t *stmt, const char *query, size_t len)
   if (fbc == NULL)
     return 1;
 
-  if (!use_ps ||
-      strcasecmp(query, "BEGIN") == 0 ||
-      strcasecmp(query, "COMMIT") == 0 ||
-      strcasecmp(query, "ROLLBACK") == 0)
+  int is_txn_control = (strcasecmp(query, "BEGIN") == 0 ||
+                        strcasecmp(query, "COMMIT") == 0 ||
+                        strcasecmp(query, "ROLLBACK") == 0);
+
+  if (!use_ps || is_txn_control)
   {
     stmt->emulated = 1;
     stmt->query = strdup(query);
+    /* Non-NULL only for a SELECT or a plain INSERT/UPDATE/DELETE: its type,
+     * so that fb_query() can use one attachment-level call. */
+    if (!is_txn_control)
+      stmt->ptr = fb_describe_template(fbc, query);
     return 0;
   }
 
@@ -1418,7 +1567,7 @@ db_error_t firebird_drv_execute(db_stmt_t *stmt, db_result_t *rs)
   }
   buf[j] = '\0';
 
-  db_error_t rc = firebird_drv_query(con, buf, j, rs);
+  db_error_t rc = fb_query(con, buf, rs, (fb_stmt_t *)stmt->ptr);
   free(buf);
   return rc;
 }
@@ -1427,9 +1576,79 @@ db_error_t firebird_drv_execute(db_stmt_t *stmt, db_result_t *rs)
 db_error_t firebird_drv_query(db_conn_t *sb_conn, const char *query, size_t len,
                               db_result_t *rs)
 {
-  fb_conn_t *fbc = (fb_conn_t *)sb_conn->ptr;
-
   (void)len;
+
+  return fb_query(sb_conn, query, rs, NULL);
+}
+
+
+/* Error exit of fb_query(): record the error, then roll back the
+ * transaction fb_query() started itself. */
+static db_error_t fb_query_error(db_conn_t *sb_conn, fb_conn_t *fbc,
+                                 const char *func, const char *query,
+                                 db_result_t *rs, int auto_txn)
+{
+  db_error_t err = fb_handle_error(sb_conn, fbc, func, query, &rs->counter);
+  if (auto_txn && fbc->tra)
+  {
+    struct IStatus *rst = IMaster_getStatus(fb_master);
+    ITransaction_rollback(fbc->tra, rst);
+    IStatus_dispose(rst);
+    fbc->tra = NULL;
+  }
+  return err;
+}
+
+
+/* Read all rows of an open SELECT cursor into rs, close the cursor and end
+ * the transaction fb_query() started itself. */
+static db_error_t fb_query_rows(db_conn_t *sb_conn, fb_conn_t *fbc,
+                                struct IResultSet *curs,
+                                struct IMessageMetadata *out_meta,
+                                const char *query, db_result_t *rs,
+                                int auto_txn)
+{
+  fb_result_t *fbrs = NULL;
+  int frc = fb_fetch_all(fbc, curs, out_meta, &fbrs);
+
+  if (frc != 0)
+  {
+    db_error_t err;
+    if (frc > 0)
+      err = fb_query_error(sb_conn, fbc, "fetchNext", query, rs, auto_txn);
+    else
+    {
+      rs->counter = SB_CNT_ERROR;
+      err = DB_ERROR_FATAL;
+    }
+    fb_close_cursor(curs);
+    return err;
+  }
+
+  fb_close_cursor(curs);
+
+  rs->counter = SB_CNT_READ;
+  rs->nrows = fbrs->nrows;
+  rs->nfields = fbrs->nfields;
+  rs->ptr = fbrs;
+
+  if (auto_txn)
+  {
+    ITransaction_commit(fbc->tra, fbc->st);
+    fbc->tra = NULL;
+  }
+
+  return DB_ERROR_NONE;
+}
+
+
+/* desc holds the type of an emulated prepared SELECT or plain
+ * INSERT/UPDATE/DELETE (see fb_describe_template()). It is NULL for a plain
+ * query() call and for any other statement. */
+static db_error_t fb_query(db_conn_t *sb_conn, const char *query,
+                           db_result_t *rs, fb_stmt_t *desc)
+{
+  fb_conn_t *fbc = (fb_conn_t *)sb_conn->ptr;
 
   sb_conn->sql_errno = 0;
   xfree(sb_conn->sql_state);
@@ -1691,6 +1910,58 @@ regular_query:
     return DB_ERROR_FATAL;
   }
 
+  /* A plain INSERT, UPDATE or DELETE (emulated prepared statement) runs as
+   * one IAttachment::execute call without messages instead of
+   * prepare + execute + free. */
+  if (desc != NULL && fb_is_dml(desc->stmt_type))
+  {
+    IStatus_init(fbc->st);
+    IAttachment_execute(fbc->att, fbc->st, fbc->tra, 0, query, FB_DIALECT,
+                        NULL, NULL, NULL, NULL);
+
+    if (fb_check_status(fbc->st))
+      return fb_query_error(sb_conn, fbc, "execute", query, rs, auto_txn);
+
+    rs->counter = SB_CNT_WRITE;
+    rs->nrows = 1;
+    rs->ptr = NULL;
+
+    if (auto_txn)
+    {
+      ITransaction_commit(fbc->tra, fbc->st);
+      fbc->tra = NULL;
+    }
+
+    return DB_ERROR_NONE;
+  }
+
+  /* A SELECT of an emulated prepared statement has its values in the SQL
+   * text and is never run again, so it goes through one
+   * IAttachment::openCursor call instead of prepare + openCursor + free.
+   * The engine knows the output format, so none is passed. */
+  if (desc != NULL && fb_is_select(desc->stmt_type))
+  {
+    IStatus_init(fbc->st);
+    struct IResultSet *curs = IAttachment_openCursor(fbc->att, fbc->st,
+        fbc->tra, 0, query, FB_DIALECT, NULL, NULL, NULL, NULL, 0);
+    if (fb_check_status(fbc->st))
+      return fb_query_error(sb_conn, fbc, "openCursor", query, rs, auto_txn);
+
+    struct IMessageMetadata *out_meta = IResultSet_getMetadata(curs, fbc->st);
+    if (fb_check_status(fbc->st))
+    {
+      db_error_t err = fb_query_error(sb_conn, fbc, "getMetadata", query, rs,
+                                      auto_txn);
+      fb_close_cursor(curs);
+      return err;
+    }
+
+    db_error_t err = fb_query_rows(sb_conn, fbc, curs, out_meta, query, rs,
+                                   auto_txn);
+    IMessageMetadata_release(out_meta);
+    return err;
+  }
+
   /* Try as DML/DDL first via execute */
   IStatus_init(fbc->st);
 
@@ -1717,16 +1988,6 @@ regular_query:
 
   if (nfields > 0)
   {
-    unsigned out_len = IMessageMetadata_getMessageLength(out_meta, fbc->st);
-    unsigned char *out_buf = calloc(1, out_len);
-    if (out_buf == NULL)
-    {
-      IMessageMetadata_release(out_meta);
-      IStatement_free(tmp_stmt, fbc->st);
-      rs->counter = SB_CNT_ERROR;
-      return DB_ERROR_FATAL;
-    }
-
     rs->counter = SB_CNT_READ;
 
     IStatus_init(fbc->st);
@@ -1735,7 +1996,6 @@ regular_query:
 
     if (fb_check_status(fbc->st))
     {
-      free(out_buf);
       IMessageMetadata_release(out_meta);
       IStatement_free(tmp_stmt, fbc->st);
       if (auto_txn && fbc->tra)
@@ -1748,50 +2008,11 @@ regular_query:
       return fb_handle_error(sb_conn, fbc, "openCursor", query, &rs->counter);
     }
 
-    fb_result_t *fbrs = (fb_result_t *)calloc(1, sizeof(fb_result_t));
-    unsigned capacity = 64;
-    unsigned nrows = 0;
-    fbrs->nfields = nfields;
-    fbrs->values = (db_value_t *)calloc(capacity * nfields, sizeof(db_value_t));
-
-    while (IResultSet_fetchNext(curs, fbc->st, out_buf) == IStatus_RESULT_OK)
-    {
-      if (nrows >= capacity)
-      {
-        capacity *= 2;
-        db_value_t *nv = realloc(fbrs->values, capacity * nfields * sizeof(db_value_t));
-        if (nv == NULL) { fb_free_result(fbrs); free(out_buf); IResultSet_close(curs, fbc->st); IMessageMetadata_release(out_meta); IStatement_free(tmp_stmt, fbc->st); rs->counter = SB_CNT_ERROR; return DB_ERROR_FATAL; }
-        fbrs->values = nv;
-      }
-      for (unsigned ci = 0; ci < nfields; ci++)
-      {
-        uint32_t col_len = 0;
-        char *s = fb_extract_column_alloc(out_meta, fbc->st, out_buf, ci,
-                                           &col_len);
-        fbrs->values[nrows * nfields + ci].ptr = s;
-        fbrs->values[nrows * nfields + ci].len = col_len;
-        fb_result_add_string(fbrs, s);
-      }
-      nrows++;
-    }
-
-    fbrs->nrows = nrows;
-    rs->nrows = nrows;
-    rs->nfields = nfields;
-    rs->ptr = fbrs;
-
-    IResultSet_close(curs, fbc->st);
-    free(out_buf);
+    db_error_t err = fb_query_rows(sb_conn, fbc, curs, out_meta, query, rs,
+                                   auto_txn);
     IMessageMetadata_release(out_meta);
     IStatement_free(tmp_stmt, fbc->st);
-
-    if (auto_txn)
-    {
-      ITransaction_commit(fbc->tra, fbc->st);
-      fbc->tra = NULL;
-    }
-
-    return DB_ERROR_NONE;
+    return err;
   }
 
   /* DML or DDL */
