@@ -89,8 +89,9 @@ jobs:
             rpm-build gcc gcc-c++ make automake libtool pkgconfig \
             libaio-devel openssl-devel libzstd-devel \
             mariadb-connector-c-devel curl tar gzip git findutils python3
-          # pg_config is in postgresql-devel on EL, libpq-devel on Fedora
-          dnf -y install postgresql-devel || dnf -y install libpq-devel
+          # pg_config moves between postgresql-devel and libpq-devel depending
+          # on the distribution, so let dnf resolve whatever owns the binary
+          dnf -y install /usr/bin/pg_config || dnf -y install libpq-devel postgresql-devel
           command -v pg_config || { echo "pg_config not found"; exit 1; }
 
       - name: Install Firebird 5 headers
