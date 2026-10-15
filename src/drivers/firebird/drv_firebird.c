@@ -100,6 +100,10 @@ static sb_arg_t firebird_drv_args[] =
          "Transaction for a statement outside BEGIN that changes data: "
          "snapshot-rw or rc-rw",
          "snapshot-rw", STRING),
+  SB_OPT("firebird-stats",
+         "Print the database page and record counters per query, from the "
+         "first connection to the last disconnect of the process",
+         "off", BOOL),
 
   SB_OPT_END
 };
@@ -230,6 +234,19 @@ static char fb_autocommit_select;
 /* Set when the server rejected read consistency: read committed
  * transactions use the Firebird 3 form from then on. */
 static int fb_rc_fb3;
+
+/* --firebird-stats: database counters (MON$IO_STATS, MON$RECORD_STATS) at
+ * the first connection, live connections and statements since then. */
+#define FB_NSTATS 5
+static const char *const fb_stats_names[FB_NSTATS] =
+{
+  "page fetches", "page reads", "page writes", "page marks", "records read"
+};
+static char fb_stats_on;
+static int fb_stats_started;
+static long long fb_stats_start[FB_NSTATS];
+static int fb_live_conns;
+static long long fb_query_count;
 
 static int firebird_drv_init(void);
 static int firebird_drv_describe(drv_caps_t *);
@@ -1217,6 +1234,7 @@ int firebird_drv_init(void)
     return 1;
   }
   fb_autocommit_select = sb_get_value_flag("firebird-autocommit-select");
+  fb_stats_on = sb_get_value_flag("firebird-stats");
 
   fb_dlhandle = dlopen(args.client, RTLD_NOW | RTLD_GLOBAL);
   if (fb_dlhandle == NULL)
@@ -1428,6 +1446,91 @@ static void fb_log_server_settings(fb_conn_t *fbc)
 }
 
 
+/* Read the database-level counters for --firebird-stats into out[], in a
+ * transaction of its own (the MON$ snapshot is per transaction). Returns 0
+ * on success. */
+static int fb_read_db_stats(fb_conn_t *fbc, long long out[FB_NSTATS])
+{
+  static const unsigned char tpb[] =
+  {
+    isc_tpb_version3, isc_tpb_read, isc_tpb_concurrency
+  };
+  static const char sql[] =
+    "SELECT io.MON$PAGE_FETCHES, io.MON$PAGE_READS, io.MON$PAGE_WRITES,"
+    " io.MON$PAGE_MARKS, r.MON$RECORD_SEQ_READS + r.MON$RECORD_IDX_READS"
+    " FROM MON$DATABASE d"
+    " JOIN MON$IO_STATS io ON io.MON$STAT_ID = d.MON$STAT_ID"
+    " JOIN MON$RECORD_STATS r ON r.MON$STAT_ID = d.MON$STAT_ID";
+  fb_result_t *row = NULL;
+  int rc = 1;
+
+  IStatus_init(fbc->st);
+  struct ITransaction *tra = IAttachment_startTransaction(fbc->att, fbc->st,
+                                                          sizeof(tpb), tpb);
+  if (fb_check_status(fbc->st))
+    return 1;
+
+  struct IResultSet *curs = IAttachment_openCursor(fbc->att, fbc->st, tra, 0,
+      sql, FB_DIALECT, NULL, NULL, NULL, NULL, 0);
+  if (!fb_check_status(fbc->st))
+  {
+    struct IMessageMetadata *meta = IResultSet_getMetadata(curs, fbc->st);
+    if (!fb_check_status(fbc->st))
+    {
+      if (fb_fetch_all(fbc, curs, meta, &row) == 0 && row->nrows == 1 &&
+          row->nfields == FB_NSTATS)
+      {
+        for (unsigned i = 0; i < FB_NSTATS; i++)
+          out[i] = row->values[i].ptr ? strtoll(row->values[i].ptr, NULL, 10)
+                                      : 0;
+        rc = 0;
+      }
+      IMessageMetadata_release(meta);
+    }
+    fb_close_cursor(curs);
+  }
+  if (rc)
+    fb_log_error("firebird-stats", fbc->st);
+  fb_rollback_quiet(&tra);
+  IStatus_init(fbc->st);
+  fb_free_result(row);
+  return rc;
+}
+
+
+/* --firebird-stats: print the counters since the first connection, per
+ * statement. The counters are for the whole database, so other users of
+ * the database add to them. */
+static void fb_report_db_stats(fb_conn_t *fbc)
+{
+  long long now[FB_NSTATS];
+  long long queries = __sync_fetch_and_add(&fb_query_count, 0);
+  char line[512];
+  int n = 0;
+
+  if (fb_read_db_stats(fbc, now))
+    return;
+
+  for (unsigned i = 0; i < FB_NSTATS && n < (int)sizeof(line); i++)
+  {
+    long long d = now[i] - fb_stats_start[i];
+    n += snprintf(line + n, sizeof(line) - n, "%s%s %.2f (%lld)",
+                  i ? ", " : "", fb_stats_names[i],
+                  queries > 0 ? (double)d / queries : 0.0, d);
+  }
+
+  log_text(LOG_NOTICE, "Firebird database counters per statement "
+           "(total in brackets), %lld statements: %s", queries, line);
+}
+
+/* --firebird-stats: count a statement sent to the server. */
+static void fb_count_statement(void)
+{
+  if (fb_stats_on)
+    __sync_fetch_and_add(&fb_query_count, 1);
+}
+
+
 int firebird_drv_connect(db_conn_t *sb_conn)
 {
   fb_conn_t *fbc = (fb_conn_t *)calloc(1, sizeof(fb_conn_t));
@@ -1471,6 +1574,10 @@ int firebird_drv_connect(db_conn_t *sb_conn)
       __sync_bool_compare_and_swap(&fb_settings_logged, 0, 1))
     fb_log_server_settings(fbc);
 
+  __sync_fetch_and_add(&fb_live_conns, 1);
+  if (fb_stats_on && __sync_bool_compare_and_swap(&fb_stats_started, 0, 1))
+    fb_read_db_stats(fbc, fb_stats_start);
+
   sb_conn->ptr = fbc;
   return 0;
 
@@ -1499,6 +1606,11 @@ int firebird_drv_disconnect(db_conn_t *sb_conn)
   if (fbc->tra_read != NULL)
     fb_commit(fbc, &fbc->tra_read);
   fb_rollback_quiet(&fbc->tra);
+
+  /* --firebird-stats: the last connection of the process reports. */
+  if (__sync_sub_and_fetch(&fb_live_conns, 1) == 0 && fb_stats_on &&
+      fb_stats_started)
+    fb_report_db_stats(fbc);
 
   if (fbc->att != NULL)
   {
@@ -1837,6 +1949,8 @@ db_error_t firebird_drv_execute(db_stmt_t *stmt, db_result_t *rs)
     /* A prepared statement bypasses the batch, so flush it first. */
     if (fb_batch_sync(fbc))
       return DB_ERROR_FATAL;
+
+    fb_count_statement();
 
     for (i = 0; i < fbstmt->nparams; i++)
       fb_set_param(fbstmt, fbc->st, i, &stmt->bound_param[i]);
@@ -2271,6 +2385,8 @@ static db_error_t fb_query(db_conn_t *sb_conn, const char *query,
     rs->nrows = 0;
     return DB_ERROR_NONE;
   }
+
+  fb_count_statement();
 
   /* Handle CREATE TABLE IF NOT EXISTS */
   {
