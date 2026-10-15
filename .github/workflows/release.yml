@@ -114,6 +114,9 @@ jobs:
 
           ./autogen.sh
           ./configure --without-mysql --without-pgsql --without-firebird
+          # src/lua/internal/*.lua.h are generated during a build and are
+          # required by distdir, so the tree has to be built before dist
+          make -j$(nproc)
           make dist
           tarball=$(ls sysbench-*.tar.gz | head -1)
 
