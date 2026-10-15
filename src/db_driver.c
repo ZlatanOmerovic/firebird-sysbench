@@ -1070,6 +1070,23 @@ int db_bulk_insert_done(db_conn_t *con)
   if (db_bulk_do_insert(con, 1))
     return 1;
 
+  /*
+    Drivers without multi-row INSERT support flush each row as it arrives, so
+    db_bulk_do_insert() above returns early on bulk_cnt == 0 and never reaches
+    its is_last COMMIT. Issue that COMMIT here, so the rows are committed by
+    the time this function returns for every driver. bulk_commit_cnt is zero
+    when the last per-row flush already committed, which keeps this from
+    sending a redundant COMMIT.
+  */
+  if (con->bulk_single_row && con->bulk_commit_max != 0 &&
+      con->bulk_commit_cnt > 0)
+  {
+    if (db_query(con, "COMMIT", 6) == NULL &&
+        con->error == DB_ERROR_FATAL)
+      return 1;
+    con->bulk_commit_cnt = 0;
+  }
+
   if (con->bulk_buffer != NULL)
   {
     free(con->bulk_buffer);

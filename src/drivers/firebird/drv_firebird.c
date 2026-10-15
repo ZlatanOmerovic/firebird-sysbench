@@ -499,6 +499,20 @@ static int fb_batch_flush(fb_conn_t *fbc)
   return 0;
 }
 
+/* Push rows buffered in the IBatch to the server so that a statement which
+ * is not part of the batch can see them. IBatch_add() only buffers
+ * client-side until the flush threshold is reached, so without this an
+ * INSERT issued through query() stays invisible to a later SELECT on the
+ * same connection. Keeps the batch open — unlike fb_batch_close(), the next
+ * INSERT with the same base statement keeps batching. */
+static int fb_batch_sync(fb_conn_t *fbc)
+{
+  if (fbc->batch == NULL || fbc->batch_count == 0)
+    return 0;
+
+  return fb_batch_flush(fbc);
+}
+
 static void fb_batch_close(fb_conn_t *fbc)
 {
   if (fbc->batch != NULL)
@@ -1204,6 +1218,10 @@ db_error_t firebird_drv_execute(db_stmt_t *stmt, db_result_t *rs)
       fbstmt->cursor_open = 0;
     }
 
+    /* A prepared statement bypasses the batch, so flush it first. */
+    if (fb_batch_sync(fbc))
+      return DB_ERROR_FATAL;
+
     for (i = 0; i < fbstmt->nparams; i++)
       fb_set_param(fbstmt, fbc->st, i, &stmt->bound_param[i]);
 
@@ -1480,6 +1498,12 @@ db_error_t firebird_drv_query(db_conn_t *sb_conn, const char *query, size_t len,
       q++;
     if (strncasecmp(q, "CREATE TABLE IF NOT EXISTS ", 27) == 0)
     {
+      if (fb_batch_sync(fbc))
+      {
+        rs->counter = SB_CNT_ERROR;
+        return DB_ERROR_FATAL;
+      }
+
       char create_buf[4096];
       snprintf(create_buf, sizeof(create_buf), "CREATE TABLE %s", q + 27);
 
@@ -1526,6 +1550,12 @@ db_error_t firebird_drv_query(db_conn_t *sb_conn, const char *query, size_t len,
   /* Handle DROP TABLE IF EXISTS */
   if (strncasecmp(query, "DROP TABLE IF EXISTS ", 21) == 0)
   {
+    if (fb_batch_sync(fbc))
+    {
+      rs->counter = SB_CNT_ERROR;
+      return DB_ERROR_FATAL;
+    }
+
     char drop_buf[256];
     snprintf(drop_buf, sizeof(drop_buf), "DROP TABLE %s", query + 21);
 
@@ -1568,8 +1598,23 @@ db_error_t firebird_drv_query(db_conn_t *sb_conn, const char *query, size_t len,
     return DB_ERROR_NONE;
   }
 
-  /* Batch INSERT optimization — detect "INSERT INTO ... VALUES(...)" */
-  if (strncasecmp(query, "INSERT INTO ", 12) == 0)
+  /* Batch INSERT optimization — detect "INSERT INTO ... VALUES(...)".
+   *
+   * Only while a bulk insert is actually in progress. db_conn_t::bulk_buffer
+   * is non-NULL exactly between db_bulk_insert_init() and
+   * db_bulk_insert_done(), which is how the data-loading path (prepare, and
+   * bulk_insert.lua) reaches us — that path wants rows coalesced into one
+   * round trip.
+   *
+   * An INSERT issued through query() must NOT be batched. Workloads like
+   * oltp_insert send one INSERT per event and expect it to be committed when
+   * the call returns, the same as the MySQL and PostgreSQL drivers do.
+   * Batching them meant 1000 rows per round trip, committed with
+   * commitRetaining — skipping the per-statement fsync the other engines pay,
+   * which made oltp_insert measure ~4x faster than MySQL/PostgreSQL when it
+   * is in fact several times slower.
+   */
+  if (sb_conn->bulk_buffer != NULL && strncasecmp(query, "INSERT INTO ", 12) == 0)
   {
     const char *vals = strstr(query, "VALUES");
     if (vals == NULL) vals = strstr(query, "values");
@@ -1631,7 +1676,14 @@ db_error_t firebird_drv_query(db_conn_t *sb_conn, const char *query, size_t len,
   }
 
 regular_query:
-  /* Regular query via direct execution */
+  /* Regular query via direct execution. Any rows still buffered in the batch
+   * have to reach the server first, or this statement would not see them. */
+  if (fb_batch_sync(fbc))
+  {
+    rs->counter = SB_CNT_ERROR;
+    return DB_ERROR_FATAL;
+  }
+
   int auto_txn = (fbc->tra == NULL);
   if (auto_txn && fb_ensure_transaction(fbc))
   {
