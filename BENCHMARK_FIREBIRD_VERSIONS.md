@@ -1,5 +1,11 @@
 # Sysbench Benchmark Results — Firebird Cross-Version (FB4 / FB5 / FB6)
 
+> **Note on these results (added 2026-10-15).** They were measured with
+> the driver of that time: Firebird ran every SELECT outside BEGIN in one
+> long read-write snapshot transaction, and each SELECT used `openCursor` +
+> `fetch`. The current driver uses a read-only read committed transaction
+> and a one-row execute for SELECT (see FIREBIRD.md).
+
 ## Environment
 
 - **OS:** Debian 13 (trixie) on WSL2, Linux 6.6.87, x86_64

@@ -46,11 +46,85 @@ FB5. FB3 and FB4 install only the C++ interface headers.
 ### Command-line options
 
 ```
---firebird-db        Database connection string (e.g. localhost:/tmp/sbtest.fdb)
---firebird-user      User name (default: SYSDBA)
---firebird-password  Password (default: masterkey)
---firebird-client    libfbclient.so to dlopen (default: libfbclient.so)
+--firebird-db                 Database connection string (e.g. localhost:/tmp/sbtest.fdb)
+--firebird-user               User name (default: SYSDBA)
+--firebird-password           Password (default: masterkey)
+--firebird-client             libfbclient.so to dlopen (default: libfbclient.so)
+--firebird-select-mode        auto | singleton | cursor (default: auto)
+--firebird-read-tpb           TPB of a SELECT outside BEGIN (default: rc-ro)
+--firebird-autocommit-select  Commit after each SELECT outside BEGIN (default: off)
+--firebird-begin-tpb          TPB that BEGIN starts (default: snapshot-rw)
+--firebird-write-tpb          TPB of a change outside BEGIN (default: snapshot-rw)
+--firebird-stats              Page and record counters per statement (default: off)
 ```
+
+TPB values: `snapshot-rw`, `snapshot-ro`, `rc-rw`, `rc-ro`. `rc` is read
+committed with read consistency (Firebird 4 and later); with a Firebird 3
+server the driver uses `rec_version` and logs a NOTICE once. Every TPB
+waits on lock conflicts.
+
+### SELECT execution (`--firebird-select-mode`)
+
+| Mode | A prepared SELECT runs as | Protocol |
+|---|---|---|
+| `auto` (default) | `IStatement::execute` with an output message; after the first answer "more than one row" (-811), a cursor from then on | `op_execute2`: one operation |
+| `singleton` | always `IStatement::execute`; more than one row is a fatal error | `op_execute2` |
+| `cursor` | `openCursor` + `fetchNext` (the old behavior) | `op_free_statement` + `op_execute` + `op_fetch` in one packet |
+
+All three are one round trip. The SuperServer puts each operation through
+its global request queue, so one operation instead of three gives about
++5 % at 1 thread and +29 % at 8 threads (measured, `oltp_point_select`).
+No row is an empty result, not an error. With `--db-ps-mode=disable` a
+SELECT has no parameters and is never run again, so it goes through one
+`IAttachment::openCursor`; the select mode does not apply.
+
+### Transactions
+
+| Statement | Transaction | End |
+|---|---|---|
+| SELECT outside BEGIN | the read transaction, `--firebird-read-tpb` (default read-only read committed) | stays open; committed after each SELECT with `--firebird-autocommit-select=on`; ended by BEGIN, by DDL and at disconnect |
+| INSERT, UPDATE, DELETE outside BEGIN | a write transaction, `--firebird-write-tpb` | committed after the statement |
+| DDL outside BEGIN | a transaction of its own | committed after the statement; a lock or update conflict (SQLCODE -901, -913) runs it again, up to 10 times |
+| Any statement after BEGIN | the explicit transaction, `--firebird-begin-tpb` | COMMIT or ROLLBACK |
+
+Why `rc-ro` for the read transaction: each statement sees the last
+committed data, as with autocommit in MySQL and PostgreSQL, and a
+read-only read committed transaction does not hold back garbage
+collection, so it can stay open. The old driver read in one long
+read-write snapshot transaction (`--firebird-read-tpb=snapshot-rw`), which
+did not see new commits.
+
+`--firebird-autocommit-select=on` gives a real autocommit. It is slow in
+Firebird, because `op_transaction` and `op_commit` are not deferred: 3
+round trips per query. Use it as a separate test, not as the default.
+
+`--firebird-begin-tpb=snapshot-ro` is correct for `oltp_read_only` and for
+an application that knows its transaction only reads. A read-write
+transaction start writes the header page; with Forced Writes ON this is a
+synchronous disk write. MariaDB and PostgreSQL do not need the
+declaration, because they do not write at the start of a transaction.
+Publish both results for `oltp_read_only`.
+
+### Comparable results
+
+- **Same transport.** Compare DBMS through TCP on the loopback for all of
+  them. The MySQL client without `--mysql-host` uses the Unix socket,
+  which alone gives MariaDB about +25 % at 1 thread. `run_benchmarks*.sh`
+  use TCP by default (`TRANSPORT=tcp`); `TRANSPORT=local` uses the Unix
+  sockets and embedded Firebird.
+- **LINGER.** With `LINGER` 0 the SuperServer closes the database when the
+  last connection ends and drops its page cache, so each sysbench process
+  starts cold (7.4K against 15.5K QPS measured at 1M rows). Run
+  `ALTER DATABASE SET LINGER TO 60` once. The scripts do it
+  (`FIREBIRD_LINGER`).
+- **Warm-up.** Use `--warmup-time` (the scripts use `WARMUP`, default
+  10 s).
+- **Settings in the output.** The first connection of a `run` logs one
+  line: server version, page size, page buffers, Forced Writes, LINGER and
+  the wire protocol, and warns when a remote database has LINGER 0.
+- **Diagnosis.** `--firebird-stats=on` prints page fetches, page reads,
+  page writes, page marks and records read per statement, from the
+  database counters (`MON$IO_STATS`, `MON$RECORD_STATS`).
 
 ### Driver capabilities
 
@@ -89,10 +163,11 @@ Lua DDL branch. The OLTP query templates are unchanged.
 | Auto-increment | `GENERATED BY DEFAULT AS IDENTITY` (FB 3+) in Lua DDL |
 | Parameters | `?` markers — same as MySQL, no conversion needed |
 | Transactions | Driver intercepts `BEGIN`/`COMMIT`/`ROLLBACK` and calls the OO API directly |
-| Auto-commit | Driver commits after each DML statement unless the caller sent `BEGIN` |
+| Auto-commit | Driver commits after each DML and DDL statement unless the caller sent `BEGIN`; a SELECT reads in the read transaction (see Transactions) |
 | Multi-row INSERT | `multi_rows_insert=0`; the driver funnels the per-row INSERTs into `IBatch` |
 | `DROP TABLE IF EXISTS` | `IF EXISTS` stripped, SQLCODE -607 ignored |
 | `CREATE TABLE IF NOT EXISTS` | `IF NOT EXISTS` stripped, SQLCODE -607 ignored |
+| Parallel `prepare` | DDL that conflicts at commit with DDL on another connection runs again (issue #6) |
 
 ### Stability milestone
 

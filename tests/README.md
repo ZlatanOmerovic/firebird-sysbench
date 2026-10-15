@@ -39,6 +39,13 @@ recognized variables are:
 - `SBTEST_PGSQL_ARGS` -- PostgreSQL connection options: `--pgsql-host`,
   `--pgsql-port`, `--pgsql-user`, `--pgsql-password` and `--pgsql-db`.
 
+- `SBTEST_FIREBIRD_ARGS` -- Firebird connection options: `--firebird-db`,
+  `--firebird-user`, `--firebird-password` and `--firebird-client`;
+  `SBTEST_FB_BINDIR` is the path of `isql`. Set `LINGER` on the test
+  database (`ALTER DATABASE SET LINGER TO 60`): with `LINGER` 0 the driver
+  writes a warning into the output of each `run`, and the expected output
+  does not have it.
+
 For example:
 ``` {.example}
 export SBTEST_MYSQL_ARGS="--mysql-host=localhost --mysql-user=sbtest --mysql-password=secret --mysql-db=sbtest"
