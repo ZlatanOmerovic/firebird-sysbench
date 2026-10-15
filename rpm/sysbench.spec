@@ -8,13 +8,15 @@ Group:         Applications/System
 Source0:       https://github.com/akopytov/%{name}/archive/%{version}/%{name}-%{version}.tar.gz
 URL:           https://github.com/akopytov/sysbench/
 
-%if 0%{?rhel} < 7
-BuildRequires: mysql-devel
-%else
-%if 0%{?rhel} >= 9 || 0%{?fedora} >= 33
+# Fedora leaves %%{?rhel} undefined, so test it first: otherwise
+# "0%%{?rhel} < 7" is true there and pulls in the long-gone mysql-devel.
+%if 0%{?fedora} >= 33 || 0%{?rhel} >= 9
 BuildRequires: mariadb-connector-c-devel
 %else
+%if 0%{?fedora} || 0%{?rhel} >= 7
 BuildRequires: mariadb-devel
+%else
+BuildRequires: mysql-devel
 %endif
 %endif
 BuildRequires: postgresql-devel
