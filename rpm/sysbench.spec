@@ -52,6 +52,7 @@ export CFLAGS="%{optflags}"
 autoreconf -vif
 %configure --with-mysql \
            --with-pgsql \
+           --with-firebird=/opt/firebird \
 	   --without-gcc-arch
 
 %if 0%{?el6}
