@@ -1,5 +1,14 @@
 # Sysbench Benchmark Results — Three-Way (MariaDB vs PostgreSQL vs Firebird 5)
 
+> **Note on these results (added 2026-10-15).** They were measured with
+> the driver and scripts of that time. MySQL/MariaDB used the Unix socket
+> (no `--mysql-host`), while PostgreSQL and Firebird used TCP; the socket
+> alone gives MariaDB about +25 % at 1 thread. Firebird ran every SELECT
+> outside BEGIN in one long read-write snapshot transaction, and each
+> SELECT used `openCursor` + `fetch`. The current scripts use TCP for all
+> DBMS, and the current driver uses a read-only read committed transaction
+> and a one-row execute for SELECT (see FIREBIRD.md).
+
 ## Environment
 
 - **OS:** Debian 13 (trixie) on WSL2, Linux 6.6.87, x86_64

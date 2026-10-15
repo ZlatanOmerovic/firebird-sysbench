@@ -113,6 +113,9 @@ jobs:
       - name: Cram tests
         run: |
           /opt/firebird/bin/isql -user SYSDBA -password masterkey <<< "CREATE DATABASE 'localhost:/tmp/sbtest_cram.fdb' USER 'SYSDBA' PASSWORD 'masterkey' DEFAULT CHARACTER SET UTF8; QUIT;"
+          # Without LINGER the driver warns in the output of each run, and
+          # the expected test output does not have that warning.
+          /opt/firebird/bin/isql -user SYSDBA -password masterkey localhost:/tmp/sbtest_cram.fdb <<< "ALTER DATABASE SET LINGER TO 60; QUIT;"
           export SBTEST_FIREBIRD_ARGS="--firebird-db=localhost:/tmp/sbtest_cram.fdb --firebird-user=SYSDBA --firebird-password=masterkey"
           export SBTEST_FB_BINDIR=/opt/firebird/bin/isql
           make test

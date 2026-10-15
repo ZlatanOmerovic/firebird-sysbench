@@ -23,6 +23,7 @@ Firebird driver tests
   \s* (re)
   Threads started!
   \s* (re)
+  Firebird server * (glob)
   SQL statistics:
       queries performed:
           read:                            10

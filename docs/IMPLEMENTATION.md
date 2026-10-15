@@ -99,14 +99,16 @@ syntax and warns when `--thread-stack-size` is below 2M.
 | `IMaster`, `IProvider`, `IUtil` | Per process | `drv_init` |
 | `IStatus` | Per connection (not thread-safe) | `connect` |
 | `IAttachment` | Per connection | `connect` |
-| `ITransaction` | Per connection, one at a time | on demand |
+| `ITransaction` | Per connection: `tra` (explicit or write) and `tra_read` | on demand |
 
 ### Connection lifecycle
 
 ```
 connect:     IUtil_getXpbBuilder(DPB) → user/password/lc_ctype=UTF8
              → IProvider_attachDatabase()
-disconnect:  flush+close any IBatch → rollback active txn
+             → first connection of a `run`: one line of server settings
+disconnect:  flush+close any IBatch → commit tra_read → rollback tra
+             → (--firebird-stats, last connection) print the counters
              → IAttachment_detach() → IStatus_dispose()
 reconnect:   disconnect() + connect() loop
 done:        IProvider_release() → dlclose()
@@ -115,41 +117,75 @@ done:        IProvider_release() → dlclose()
 ### Transaction handling
 
 Firebird has no server-side auto-commit, so the driver owns transaction
-state. `firebird_drv_query()` intercepts the three control statements
-sysbench sends as SQL:
+state. Each connection has two transaction handles:
 
-- `BEGIN` → commit any open implicit transaction, then
-  `IAttachment_startTransaction()`, and set `in_explicit_txn`
-- `COMMIT` → close any pending `IBatch`, then `ITransaction_commit()`
-- `ROLLBACK` → `ITransaction_rollback()`
+| Handle | Used by | TPB option |
+|---|---|---|
+| `tra` | statements after `BEGIN`; outside `BEGIN`, statements that change data | `--firebird-begin-tpb`, `--firebird-write-tpb` |
+| `tra_read` | a SELECT outside `BEGIN`; prepare | `--firebird-read-tpb` |
 
-Both handles are consumed by commit/rollback, so `fbc->tra` is reset to NULL
-afterwards.
+`fb_read_transaction()` returns `tra` when it is open (after `BEGIN`, or a
+write transaction not committed yet), else `tra_read`, which stays open
+between statements. `fb_start_transaction()` builds the TPB; a read
+committed TPB asks for read consistency and falls back once to
+`rec_version` on a Firebird 3 server.
+
+`firebird_drv_query()` intercepts the three control statements sysbench
+sends as SQL:
+
+- `BEGIN` → commit any open implicit transaction and the read
+  transaction, then start `tra` with `--firebird-begin-tpb`, and set
+  `in_explicit_txn`
+- `COMMIT` → close any pending `IBatch`, then `fb_commit()`
+- `ROLLBACK` → `fb_rollback_quiet()`
 
 **Per-statement autocommit.** When no `BEGIN` was sent, `fb_ensure_transaction()`
-opens a transaction on demand and `fb_autocommit_if_implicit()` commits it
-right after the statement succeeds. This matters for benchmark fairness:
+opens a write transaction on demand and `fb_autocommit_if_implicit()` commits
+it right after the statement succeeds. This matters for benchmark fairness:
 without it, every insert in a `prepare` run accumulated in one long
 transaction and paid no fsync, which is not what MySQL and PostgreSQL do.
-Only DML autocommits — SELECT paths leave the transaction open to avoid a
-wasted round trip per query.
+A SELECT reads in `tra_read` and commits nothing, unless
+`--firebird-autocommit-select` is on.
 
-DDL and standalone statements executed with no transaction in progress take
-the same implicit path and commit (or roll back, on error) before returning.
+**Every commit is checked** (`fb_commit()`). A failed commit rolls the
+transaction back instead of losing the handle, and the error reaches the
+caller.
+
+**DDL outside a transaction** runs in a transaction of its own
+(`fb_execute_ddl()`). Firebird does most DDL work at commit time, so DDL on
+other connections (a parallel `prepare`) can make the commit fail with a
+lock or update conflict; the statement then runs again, up to 10 times.
+`fb_execute_ddl()` first ends `tra_read`: a transaction that has read a
+table keeps it "in use", and `DROP TABLE` on it would fail.
 
 ### Prepared statements
 
 ```
-prepare:      IAttachment_prepare(..., PREPARE_PREFETCH_METADATA)
-              → IStatement_getInputMetadata / getOutputMetadata
+prepare:      IAttachment_prepare(..., PREPARE_PREFETCH_METADATA) in the
+              read transaction
+              → IStatement_getType / getInputMetadata / getOutputMetadata
               → allocate flat in/out byte buffers from getMessageLength()
               → allocate per-column conversion buffers (MAX_COLUMN_LENGTH)
 bind_param:   copy sysbench's db_bind_t array; validate parameter count
 execute:      fb_set_param() writes each value into in_buf at the metadata
-              offset, then openCursor() for SELECTs / IStatement_execute()
-              for DML
+              offset; a SELECT then runs per --firebird-select-mode (below),
+              DML through IStatement_execute()
 close:        IResultSet_close → release metadata → IStatement_free
 ```
+
+**One-row execute.** With `--firebird-select-mode=auto` (default) or
+`singleton`, a SELECT runs as `IStatement_execute()` with the output message:
+the client sends one `op_execute2` instead of `op_free_statement` +
+`op_execute` + `op_fetch`, and the SuperServer queues one request instead of
+three. The engine runs it as a singleton select:
+
+| Result | Status | Driver action |
+|---|---|---|
+| one row | success | row is in `out_buf`, extracted in place |
+| no row | `isc_stream_eof` | empty result |
+| more than one row | `isc_sing_select_err` (-811) | `auto`: set `multi_row`, run again through the cursor, use the cursor from then on; `singleton`: fatal error |
+
+`--firebird-select-mode=cursor` keeps the cursor path for every SELECT.
 
 There is no XSQLDA. Parameters and results live in flat byte buffers, written
 and read at the offsets `IMessageMetadata` reports:
@@ -183,8 +219,9 @@ describe, so they always take the generic path.
 
 ### Result set handling
 
-The OLTP workloads are dominated by single-row point selects, so
-`firebird_drv_execute()` has a fast path for them:
+The OLTP workloads are dominated by single-row point selects. The one-row
+execute puts the row into the statement's `out_buf`, and the columns are
+extracted in place as in step 1 below. The cursor path works like this:
 
 1. Fetch the first row into the statement's `out_buf` and extract columns
    **in place** with `fb_extract_column_fast()` — integers formatted into
@@ -194,8 +231,9 @@ The OLTP workloads are dominated by single-row point selects, so
    statement itself; `fetch_row()` returns the cached values.
 3. If a second row exists, fall back to the general path: allocate an
    `fb_result_t`, re-extract row 0 from a snapshot taken before the second
-   fetch, then materialise every remaining row with
-   `fb_extract_column_alloc()`. The row array doubles from a capacity of 64.
+   fetch (`row0_buf`, allocated once per statement), then materialise every
+   remaining row with `fb_extract_column_alloc()`. The row array doubles
+   from a capacity of 64.
 
 `fb_query()` (non-prepared path) always uses the general `fb_result_t` form,
 built by `fb_fetch_all()`; a fetch error is reported, not cut short into a
