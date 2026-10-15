@@ -18,18 +18,75 @@ The legacy ISC API driver is preserved on the `firebird-isc` branch; it is the
 only option for Firebird 3 (see [Supported Firebird
 Versions](#supported-firebird-versions)).
 
-## Quick Start
+## Build Requirements
 
-Building needs headers from **Firebird 5 or newer** — `fb_c_api.h` first
-shipped in FB5, and FB3/FB4 install only the C++ interface headers. The
-resulting binary still connects to FB4 servers at runtime.
+sysbench's own dependencies, from the upstream README:
 
 ```bash
-# Build (--with-firebird must point at an FB5+ installation)
+# Debian/Ubuntu
+apt -y install make automake libtool pkg-config libaio-dev
+apt -y install libmysqlclient-dev libssl-dev   # for MySQL/MariaDB support
+apt -y install libpq-dev                       # for PostgreSQL support
+
+# RHEL/CentOS
+yum -y install make automake libtool pkgconfig libaio-devel
+yum -y install mariadb-devel openssl-devel     # for MySQL/MariaDB support
+yum -y install postgresql-devel                # for PostgreSQL support
+```
+
+For the Firebird driver you additionally need **Firebird 5 or newer
+installed, with its development headers**. `fb_c_api.h` first shipped in
+FB5; FB3 and FB4 install only the C++ interface headers, so they cannot be
+built against — though the resulting binary still connects to FB3 and FB4
+*servers* at runtime.
+
+Distribution packages are generally **too old**. Debian 13 ships
+`firebird-dev` 4.0.5, and most distributions are still on FB3 or FB4, none of
+which carry `fb_c_api.h`. Two ways to get FB5+ headers:
+
+- Install the official binary tarball from
+  [firebirdsql.org](https://firebirdsql.org/en/firebird-5-0/) — it includes
+  `include/firebird/` and is the quickest route.
+- Build Firebird from source, which is also what you need if you want to
+  benchmark several versions side by side. See
+  [docs/BUILDING_FIREBIRD.md](docs/BUILDING_FIREBIRD.md).
+
+Either way, point `--with-firebird` at the installation prefix.
+
+`libfbclient.so` itself is **not** linked at build time: the driver loads it
+with `dlopen` at startup, so only the headers are needed to compile.
+
+## Build and Install
+
+```bash
 ./autogen.sh
 ./configure --with-firebird=/opt/firebird
 make -j$(nproc)
+sudo make install        # optional; ./src/sysbench runs from the build tree
+```
 
+`--with-firebird` takes the installation prefix. If your headers and
+libraries live in unusual places, `--with-firebird-includes` and
+`--with-firebird-libs` set them explicitly; with no path given, `configure`
+falls back to `fb_config` on the `PATH`.
+
+All three drivers can be built together:
+
+```bash
+./configure --with-mysql --with-pgsql --with-firebird=/opt/firebird
+```
+
+Use `--without-mysql` and `--without-pgsql` if you only want the Firebird
+driver. To check what was built:
+
+```bash
+./src/sysbench --version
+./src/sysbench --help | grep -A5 "firebird options"
+```
+
+## Quick Start
+
+```bash
 # Create a test database (using Firebird's isql)
 isql -user SYSDBA -password masterkey <<< "CREATE DATABASE 'localhost:/tmp/sbtest.fdb' USER 'SYSDBA' PASSWORD 'masterkey' DEFAULT CHARACTER SET UTF8; QUIT;"
 
@@ -124,13 +181,6 @@ The driver probes the runtime `IUtil` vtable version in `drv_init`:
   statement: FB4.0.7's client already reports v4 or newer and keeps
   batching, so no client tested here lands in this branch.
 - **v4 and up** — everything enabled. FB4, FB5 and FB6 clients all qualify.
-
-## Building with Multiple Drivers
-
-```bash
-./configure --with-mysql --with-pgsql --with-firebird=/opt/firebird
-make -j$(nproc)
-```
 
 ## Benchmark Scripts
 
