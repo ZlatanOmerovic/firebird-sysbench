@@ -31,6 +31,7 @@
 #include <inttypes.h>
 #include <pthread.h>
 #include <dlfcn.h>
+#include <unistd.h>
 
 #include "firebird/fb_c_api.h"
 
@@ -42,6 +43,33 @@
 #define MAX_COLUMN_LENGTH 512UL
 #define FB_DIALECT 3
 
+/* A DDL statement whose commit fails with a lock or update conflict runs
+ * again, up to this many times in all. */
+#define FB_DDL_ATTEMPTS 10
+
+/* Status codes the driver checks (iberror.h). */
+#ifndef isc_deadlock
+# define isc_deadlock        335544336L
+#endif
+#ifndef isc_lock_conflict
+# define isc_lock_conflict   335544345L
+#endif
+#ifndef isc_update_conflict
+# define isc_update_conflict 335544451L
+#endif
+#ifndef isc_lock_timeout
+# define isc_lock_timeout    335544510L
+#endif
+#ifndef isc_stream_eof
+# define isc_stream_eof      335544374L
+#endif
+#ifndef isc_sing_select_err
+# define isc_sing_select_err 335544652L
+#endif
+#ifndef isc_tpb_read_consistency
+# define isc_tpb_read_consistency 22  /* Firebird 4 and later */
+#endif
+
 static sb_arg_t firebird_drv_args[] =
 {
   SB_OPT("firebird-db", "Firebird database connection string",
@@ -51,6 +79,27 @@ static sb_arg_t firebird_drv_args[] =
   SB_OPT("firebird-client",
          "Path to libfbclient.so to load at runtime (overrides default)",
          "libfbclient.so", STRING),
+  SB_OPT("firebird-select-mode",
+         "How a prepared SELECT runs: auto (one-row execute; a cursor after "
+         "it returns more than one row), singleton (always one-row execute), "
+         "cursor (openCursor and fetch)",
+         "auto", STRING),
+  SB_OPT("firebird-read-tpb",
+         "Transaction for a SELECT outside BEGIN, kept open between "
+         "statements: snapshot-rw, snapshot-ro, rc-rw or rc-ro "
+         "(rc = read committed)",
+         "rc-ro", STRING),
+  SB_OPT("firebird-autocommit-select",
+         "Commit the read transaction after each SELECT outside BEGIN",
+         "off", BOOL),
+  SB_OPT("firebird-begin-tpb",
+         "Transaction that BEGIN starts: snapshot-rw, snapshot-ro, rc-rw or "
+         "rc-ro",
+         "snapshot-rw", STRING),
+  SB_OPT("firebird-write-tpb",
+         "Transaction for a statement outside BEGIN that changes data: "
+         "snapshot-rw or rc-rw",
+         "snapshot-rw", STRING),
 
   SB_OPT_END
 };
@@ -80,7 +129,13 @@ static isc_sqlcode_t   p_isc_sqlcode;
 typedef struct
 {
   struct IAttachment *att;
+  /* After BEGIN: the explicit transaction (--firebird-begin-tpb). Outside
+   * BEGIN: the transaction of a statement that changes data
+   * (--firebird-write-tpb), committed after the statement. */
   struct ITransaction *tra;
+  /* A SELECT outside BEGIN (--firebird-read-tpb). It stays open, unless
+   * --firebird-autocommit-select is on. */
+  struct ITransaction *tra_read;
   struct IStatus *st;
   struct IBatch *batch;
   struct IStatement *batch_stmt;
@@ -104,11 +159,17 @@ typedef struct
   unsigned char *out_buf;
   unsigned nparams;
   unsigned nfields;
+  unsigned stmt_type;  /* isc_info_sql_stmt_* from IStatement::getType() */
   char prepared;
   char cursor_open;
   struct IResultSet *cursor;
   db_value_t *cached_values;
   char **conv_bufs;
+  /* Copy of row 0 while the cursor path fetches row 1 (out_buf_len bytes) */
+  unsigned char *row0_buf;
+  /* 1 once the SELECT returned more than one row to a one-row execute: in
+   * --firebird-select-mode=auto it uses the cursor from then on. */
+  char multi_row;
 } fb_stmt_t;
 
 typedef struct
@@ -136,6 +197,39 @@ static char use_ps;
 /* Set when the runtime libfbclient is older than FB4 — IStatement::createBatch
  * is absent from its vtable, so dispatching through that slot would crash. */
 static char fb_no_batch;
+/* Set by the first connection of the process, which logs the server
+ * settings. */
+static int fb_settings_logged;
+
+/* --firebird-select-mode */
+typedef enum
+{
+  FB_SELECT_AUTO,
+  FB_SELECT_SINGLETON,
+  FB_SELECT_CURSOR
+} fb_select_mode_t;
+static fb_select_mode_t fb_select_mode;
+
+/* A transaction parameter block from an option value. A read committed TPB
+ * has a second form for Firebird 3 servers, which do not know read
+ * consistency. */
+typedef struct
+{
+  const char *name;
+  char rc;
+  unsigned len;
+  unsigned char tpb[8];
+  unsigned len3;
+  unsigned char tpb3[8];
+} fb_tpb_t;
+
+static fb_tpb_t fb_read_tpb;   /* --firebird-read-tpb */
+static fb_tpb_t fb_begin_tpb;  /* --firebird-begin-tpb */
+static fb_tpb_t fb_write_tpb;  /* --firebird-write-tpb */
+static char fb_autocommit_select;
+/* Set when the server rejected read consistency: read committed
+ * transactions use the Firebird 3 form from then on. */
+static int fb_rc_fb3;
 
 static int firebird_drv_init(void);
 static int firebird_drv_describe(drv_caps_t *);
@@ -153,6 +247,9 @@ static db_error_t firebird_drv_query(db_conn_t *, const char *, size_t,
 static int firebird_drv_free_results(db_result_t *);
 static int firebird_drv_close(db_stmt_t *);
 static int firebird_drv_done(void);
+
+static db_error_t fb_query(db_conn_t *, const char *, db_result_t *,
+                           fb_stmt_t *);
 
 static db_driver_t firebird_driver =
 {
@@ -236,6 +333,65 @@ static db_error_t fb_handle_error(db_conn_t *con, fb_conn_t *fbc,
   return DB_ERROR_FATAL;
 }
 
+/* Roll back *tra and forget it. Uses its own status, so that fbc->st keeps
+ * the error that made the rollback necessary. */
+static void fb_rollback_quiet(struct ITransaction **tra)
+{
+  if (*tra == NULL)
+    return;
+
+  struct IStatus *rst = IMaster_getStatus(fb_master);
+  ITransaction_rollback(*tra, rst);
+  if (fb_check_status(rst))
+    ITransaction_release(*tra);  /* rollback() releases only on success */
+  IStatus_dispose(rst);
+  *tra = NULL;
+}
+
+/* Commit *tra and forget it. When the commit fails, the transaction is
+ * rolled back, not lost, and the error stays in fbc->st. Returns 0 on
+ * success. */
+static int fb_commit(fb_conn_t *fbc, struct ITransaction **tra)
+{
+  IStatus_init(fbc->st);
+  ITransaction_commit(*tra, fbc->st);
+  if (!fb_check_status(fbc->st))
+  {
+    *tra = NULL;
+    return 0;
+  }
+
+  fb_rollback_quiet(tra);
+  return 1;
+}
+
+/* 1 if the status vector of st holds the error code, at any position. */
+static int fb_status_has(struct IStatus *st, intptr_t code)
+{
+  const intptr_t *v = IStatus_getErrors(st);
+
+  for (; *v != isc_arg_end; v += (*v == isc_arg_cstring) ? 3 : 2)
+    if (*v == isc_arg_gds && v[1] == code)
+      return 1;
+
+  return 0;
+}
+
+/* 1 if the error in st is a lock or update conflict with another
+ * transaction (SQLCODE -901 or -913, or one of those codes after another
+ * error such as "unsuccessful metadata update"). A new attempt can avoid
+ * it. */
+static int fb_is_conflict(struct IStatus *st)
+{
+  long sqlcode = p_isc_sqlcode(IStatus_getErrors(st));
+
+  return sqlcode == -901 || sqlcode == -913 ||
+         fb_status_has(st, isc_deadlock) ||
+         fb_status_has(st, isc_lock_conflict) ||
+         fb_status_has(st, isc_update_conflict) ||
+         fb_status_has(st, isc_lock_timeout);
+}
+
 /* Commit the implicit transaction after a successful statement when the
  * caller has not opened an explicit one with BEGIN. Matches MySQL/PgSQL
  * autocommit semantics so per-row cost (including fsync) is comparable. */
@@ -244,10 +400,7 @@ static int fb_autocommit_if_implicit(fb_conn_t *fbc)
   if (fbc->in_explicit_txn || fbc->tra == NULL)
     return 0;
 
-  IStatus_init(fbc->st);
-  ITransaction_commit(fbc->tra, fbc->st);
-  fbc->tra = NULL;
-  if (fb_check_status(fbc->st))
+  if (fb_commit(fbc, &fbc->tra))
   {
     fb_log_error("autocommit", fbc->st);
     return 1;
@@ -255,21 +408,191 @@ static int fb_autocommit_if_implicit(fb_conn_t *fbc)
   return 0;
 }
 
+/* Start a transaction with the TPB of an option. A read committed TPB asks
+ * for read consistency (Firebird 4 and later). When the server rejects it,
+ * the Firebird 3 form (rec_version) is used from then on, and a NOTICE
+ * tells it once. Returns NULL on error, with the error in fbc->st. */
+static struct ITransaction *fb_start_transaction(fb_conn_t *fbc,
+                                                 const fb_tpb_t *t)
+{
+  int fb3 = t->rc && fb_rc_fb3;
+
+  IStatus_init(fbc->st);
+  struct ITransaction *tra = IAttachment_startTransaction(fbc->att, fbc->st,
+      fb3 ? t->len3 : t->len, fb3 ? t->tpb3 : t->tpb);
+  if (!fb_check_status(fbc->st))
+    return tra;
+  if (!t->rc || fb3)
+    return NULL;
+
+  IStatus_init(fbc->st);
+  tra = IAttachment_startTransaction(fbc->att, fbc->st, t->len3, t->tpb3);
+  if (fb_check_status(fbc->st))
+    return NULL;
+
+  if (__sync_bool_compare_and_swap(&fb_rc_fb3, 0, 1))
+    log_text(LOG_NOTICE, "The server does not support read consistency "
+             "(Firebird 3 or older): read committed transactions use "
+             "rec_version.");
+  return tra;
+}
+
+/* The transaction for a statement that changes data: the open one, or a
+ * new one with --firebird-write-tpb. */
 static int fb_ensure_transaction(fb_conn_t *fbc)
 {
   if (fbc->tra != NULL)
     return 0;
 
-  IStatus_init(fbc->st);
-  fbc->tra = IAttachment_startTransaction(fbc->att, fbc->st, 0, NULL);
-  if (fb_check_status(fbc->st))
+  fbc->tra = fb_start_transaction(fbc, &fb_write_tpb);
+  if (fbc->tra == NULL)
   {
     fb_log_error("startTransaction", fbc->st);
-    fbc->tra = NULL;
     return 1;
   }
 
   return 0;
+}
+
+/* The transaction for a SELECT: the open transaction, if there is one
+ * (after BEGIN, or a write transaction not committed yet); otherwise the
+ * read transaction of the connection (--firebird-read-tpb), which stays
+ * open between statements. Returns NULL on error. */
+static struct ITransaction *fb_read_transaction(fb_conn_t *fbc)
+{
+  if (fbc->tra != NULL)
+    return fbc->tra;
+
+  if (fbc->tra_read == NULL)
+  {
+    fbc->tra_read = fb_start_transaction(fbc, &fb_read_tpb);
+    if (fbc->tra_read == NULL)
+      fb_log_error("startTransaction(read)", fbc->st);
+  }
+  return fbc->tra_read;
+}
+
+/* --firebird-autocommit-select: commit the read transaction after a SELECT
+ * that ran in it. Close the cursor first. Returns 0 on success. */
+static int fb_autocommit_read(fb_conn_t *fbc, struct ITransaction *tra)
+{
+  if (!fb_autocommit_select || tra == NULL || tra != fbc->tra_read)
+    return 0;
+
+  if (fb_commit(fbc, &fbc->tra_read))
+  {
+    fb_log_error("commit(read)", fbc->st);
+    return 1;
+  }
+  return 0;
+}
+
+/* End the read transaction, if it is open. A transaction that has read a
+ * table keeps it "in use", so DDL on that table (DROP TABLE) would fail;
+ * BEGIN and DDL outside BEGIN end it first. It holds no changes. */
+static void fb_end_read_transaction(fb_conn_t *fbc)
+{
+  if (fbc->tra_read != NULL)
+    fb_commit(fbc, &fbc->tra_read);
+}
+
+/* The transaction that ends with a SELECT that ran in tra: the read
+ * transaction with --firebird-autocommit-select, otherwise none. */
+static struct ITransaction **fb_read_end(fb_conn_t *fbc,
+                                         struct ITransaction *tra)
+{
+  if (fb_autocommit_select && tra != NULL && tra == fbc->tra_read)
+    return &fbc->tra_read;
+  return NULL;
+}
+
+/* Run a DDL statement in a transaction of its own and commit it. Firebird
+ * does most of the DDL work at commit time, so DDL on other connections
+ * (a parallel prepare) can make the commit fail with a lock or update
+ * conflict. Then the statement runs again in a new transaction, up to
+ * FB_DDL_ATTEMPTS times. Returns 0 on success; on failure the error is in
+ * fbc->st and no transaction is left open. Call it only when fbc->tra is
+ * NULL. */
+static int fb_execute_ddl(fb_conn_t *fbc, const char *sql)
+{
+  fb_end_read_transaction(fbc);
+
+  for (unsigned attempt = 1; ; attempt++)
+  {
+    if (fb_ensure_transaction(fbc))
+      return 1;
+
+    IStatus_init(fbc->st);
+    IAttachment_execute(fbc->att, fbc->st, fbc->tra, 0, sql, FB_DIALECT,
+                        NULL, NULL, NULL, NULL);
+    if (!fb_check_status(fbc->st) && fb_commit(fbc, &fbc->tra) == 0)
+      return 0;
+
+    fb_rollback_quiet(&fbc->tra);  /* no-op when the commit failed */
+    if (attempt >= FB_DDL_ATTEMPTS || !fb_is_conflict(fbc->st))
+      return 1;
+
+    log_text(LOG_DEBUG, "DDL conflict, attempt %u of %u: %s", attempt,
+             FB_DDL_ATTEMPTS, sql);
+    usleep(10000 * attempt);
+  }
+}
+
+static int fb_is_dml(unsigned stmt_type)
+{
+  return stmt_type == isc_info_sql_stmt_insert ||
+         stmt_type == isc_info_sql_stmt_update ||
+         stmt_type == isc_info_sql_stmt_delete;
+}
+
+/* Learn the type of an emulated prepared statement once: prepare the
+ * template and free it at once. Every later execution then sends the
+ * literal SQL text with one attachment-level call:
+ *  - a SELECT through IAttachment::openCursor; the engine knows the output
+ *    format, so none is passed;
+ *  - an INSERT, UPDATE or DELETE without RETURNING through
+ *    IAttachment::execute.
+ * Returns NULL for any other statement and when the describe fails; those
+ * keep the generic query() path, which reports any error at execution
+ * time. */
+static fb_stmt_t *fb_describe_template(fb_conn_t *fbc, const char *query)
+{
+  /* Prepare in the read transaction: a write transaction left open would
+   * keep fb_query() from committing the next statement. */
+  struct ITransaction *tra = fb_read_transaction(fbc);
+  if (tra == NULL)
+    return NULL;
+
+  IStatus_init(fbc->st);
+  struct IStatement *tmp_stmt = IAttachment_prepare(fbc->att, fbc->st,
+      tra, 0, query, FB_DIALECT, IStatement_PREPARE_PREFETCH_METADATA);
+  unsigned stmt_type = 0;
+  unsigned nfields = 0;
+  int described = 0;
+  if (!fb_check_status(fbc->st))
+  {
+    stmt_type = IStatement_getType(tmp_stmt, fbc->st);
+    struct IMessageMetadata *out_meta = IStatement_getOutputMetadata(tmp_stmt,
+                                                                      fbc->st);
+    if (out_meta != NULL)
+    {
+      nfields = IMessageMetadata_getCount(out_meta, fbc->st);
+      IMessageMetadata_release(out_meta);
+    }
+    described = (out_meta != NULL && !fb_check_status(fbc->st));
+    IStatement_free(tmp_stmt, fbc->st);
+  }
+  IStatus_init(fbc->st);
+
+  if (!described ||
+      !((stmt_type == isc_info_sql_stmt_select && nfields > 0) ||
+        (fb_is_dml(stmt_type) && nfields == 0)))
+    return NULL;
+
+  fb_stmt_t *desc = (fb_stmt_t *)calloc(1, sizeof(fb_stmt_t));
+  if (desc != NULL)
+    desc->stmt_type = stmt_type;
+  return desc;
 }
 
 static void fb_extract_column_fast(struct IMessageMetadata *meta,
@@ -464,6 +787,75 @@ static void fb_free_result(fb_result_t *fbrs)
   free(fbrs->strings);
   free(fbrs->values);
   free(fbrs);
+}
+
+/* Read every row of an open cursor into a new fb_result_t (*out).
+ * Returns 0 on success, 1 on a fetch error (status left in fbc->st) and
+ * -1 when memory runs out. The caller closes the cursor. */
+static int fb_fetch_all(fb_conn_t *fbc, struct IResultSet *curs,
+                        struct IMessageMetadata *out_meta, fb_result_t **out)
+{
+  unsigned nfields = IMessageMetadata_getCount(out_meta, fbc->st);
+  unsigned out_len = IMessageMetadata_getMessageLength(out_meta, fbc->st);
+  unsigned capacity = 64;
+  unsigned char *out_buf = (unsigned char *)calloc(1, out_len);
+  fb_result_t *fbrs = (fb_result_t *)calloc(1, sizeof(fb_result_t));
+  int rc = -1;
+
+  *out = NULL;
+  if (fbrs != NULL)
+    fbrs->values = (db_value_t *)calloc(capacity * nfields,
+                                        sizeof(db_value_t));
+
+  if (out_buf != NULL && fbrs != NULL && fbrs->values != NULL)
+  {
+    int frc;
+
+    rc = 0;
+    fbrs->nfields = nfields;
+    while ((frc = IResultSet_fetchNext(curs, fbc->st, out_buf))
+           == IStatus_RESULT_OK)
+    {
+      if (fbrs->nrows >= capacity)
+      {
+        capacity *= 2;
+        db_value_t *nv = realloc(fbrs->values,
+                                 capacity * nfields * sizeof(db_value_t));
+        if (nv == NULL) { rc = -1; break; }
+        fbrs->values = nv;
+      }
+      for (unsigned ci = 0; ci < nfields; ci++)
+      {
+        uint32_t col_len = 0;
+        char *s = fb_extract_column_alloc(out_meta, fbc->st, out_buf, ci,
+                                           &col_len);
+        fbrs->values[fbrs->nrows * nfields + ci].ptr = s;
+        fbrs->values[fbrs->nrows * nfields + ci].len = col_len;
+        fb_result_add_string(fbrs, s);
+      }
+      fbrs->nrows++;
+    }
+    if (rc == 0 && frc != IStatus_RESULT_NO_DATA)
+      rc = 1;
+  }
+
+  free(out_buf);
+  if (rc == 0)
+    *out = fbrs;
+  else
+    fb_free_result(fbrs);
+  return rc;
+}
+
+/* Close a cursor whatever state the connection is in. close() releases the
+ * interface only when it succeeds. */
+static void fb_close_cursor(struct IResultSet *curs)
+{
+  struct IStatus *rst = IMaster_getStatus(fb_master);
+  IResultSet_close(curs, rst);
+  if (fb_check_status(rst))
+    IResultSet_release(curs);
+  IStatus_dispose(rst);
 }
 
 
@@ -745,12 +1137,86 @@ int register_driver_firebird(sb_list_t *drivers)
 }
 
 
+/* Build the TPB for a --firebird-*-tpb option. Values: snapshot-rw,
+ * snapshot-ro, rc-rw, rc-ro. "rc" is read committed with read consistency
+ * (Firebird 4 and later), with rec_version in the Firebird 3 form. Every
+ * TPB waits on lock conflicts. Returns 0 on success. */
+static int fb_parse_tpb(const char *opt, fb_tpb_t *t)
+{
+  const char *v = sb_get_value_string(opt);
+  unsigned char access;
+  int rc;
+
+  if (strcasecmp(v, "snapshot-rw") == 0)
+  { access = isc_tpb_write; rc = 0; }
+  else if (strcasecmp(v, "snapshot-ro") == 0)
+  { access = isc_tpb_read; rc = 0; }
+  else if (strcasecmp(v, "rc-rw") == 0)
+  { access = isc_tpb_write; rc = 1; }
+  else if (strcasecmp(v, "rc-ro") == 0)
+  { access = isc_tpb_read; rc = 1; }
+  else
+  {
+    log_text(LOG_FATAL, "Invalid value for --%s: '%s'. Use snapshot-rw, "
+             "snapshot-ro, rc-rw or rc-ro.", opt, v);
+    return 1;
+  }
+
+  memset(t, 0, sizeof(*t));
+  t->name = v;
+  t->rc = (char)rc;
+
+  t->tpb[t->len++] = isc_tpb_version3;
+  t->tpb[t->len++] = access;
+  if (rc)
+  {
+    t->tpb[t->len++] = isc_tpb_read_committed;
+    memcpy(t->tpb3, t->tpb, t->len);
+    t->len3 = t->len;
+    t->tpb[t->len++] = isc_tpb_read_consistency;
+    t->tpb3[t->len3++] = isc_tpb_rec_version;
+    t->tpb3[t->len3++] = isc_tpb_wait;
+  }
+  else
+    t->tpb[t->len++] = isc_tpb_concurrency;
+  t->tpb[t->len++] = isc_tpb_wait;
+
+  return 0;
+}
+
+
 int firebird_drv_init(void)
 {
   args.db = sb_get_value_string("firebird-db");
   args.user = sb_get_value_string("firebird-user");
   args.password = sb_get_value_string("firebird-password");
   args.client = sb_get_value_string("firebird-client");
+
+  const char *select_mode = sb_get_value_string("firebird-select-mode");
+  if (strcasecmp(select_mode, "auto") == 0)
+    fb_select_mode = FB_SELECT_AUTO;
+  else if (strcasecmp(select_mode, "singleton") == 0)
+    fb_select_mode = FB_SELECT_SINGLETON;
+  else if (strcasecmp(select_mode, "cursor") == 0)
+    fb_select_mode = FB_SELECT_CURSOR;
+  else
+  {
+    log_text(LOG_FATAL, "Invalid value for --firebird-select-mode: '%s'. "
+             "Use auto, singleton or cursor.", select_mode);
+    return 1;
+  }
+
+  if (fb_parse_tpb("firebird-read-tpb", &fb_read_tpb) ||
+      fb_parse_tpb("firebird-begin-tpb", &fb_begin_tpb) ||
+      fb_parse_tpb("firebird-write-tpb", &fb_write_tpb))
+    return 1;
+  if (fb_write_tpb.tpb[1] != isc_tpb_write)
+  {
+    log_text(LOG_FATAL, "--firebird-write-tpb must allow writes: use "
+             "snapshot-rw or rc-rw, not '%s'.", fb_write_tpb.name);
+    return 1;
+  }
+  fb_autocommit_select = sb_get_value_flag("firebird-autocommit-select");
 
   fb_dlhandle = dlopen(args.client, RTLD_NOW | RTLD_GLOBAL);
   if (fb_dlhandle == NULL)
@@ -850,6 +1316,118 @@ int firebird_drv_describe(drv_caps_t *caps)
 }
 
 
+/* Log the server settings that change the results: server version, page
+ * size, page buffers, Forced Writes, LINGER and the wire protocol. Warn
+ * when the database is remote and LINGER is 0. */
+static void fb_log_server_settings(fb_conn_t *fbc)
+{
+  static const unsigned char items[] =
+  {
+    isc_info_firebird_version, isc_info_page_size, isc_info_num_buffers,
+    isc_info_forced_writes, isc_info_end
+  };
+  static const unsigned char tpb[] =
+  {
+    isc_tpb_version3, isc_tpb_read, isc_tpb_read_committed,
+    isc_tpb_rec_version
+  };
+  static const char sql[] =
+    "SELECT COALESCE(RDB$LINGER, 0),"
+    " COALESCE(RDB$GET_CONTEXT('SYSTEM', 'NETWORK_PROTOCOL'), ''),"
+    " COALESCE(RDB$GET_CONTEXT('SYSTEM', 'WIRE_ENCRYPTED'), '?'),"
+    " COALESCE(RDB$GET_CONTEXT('SYSTEM', 'WIRE_COMPRESSED'), '?')"
+    " FROM RDB$DATABASE";
+  unsigned char info[256];
+  char version[128] = "?";
+  long page_size = 0, buffers = 0, forced_writes = -1;
+  fb_result_t *row = NULL;
+
+  IStatus_init(fbc->st);
+  IAttachment_getInfo(fbc->att, fbc->st, sizeof(items), items, sizeof(info),
+                      info);
+  if (!fb_check_status(fbc->st))
+  {
+    const unsigned char *p = info;
+    const unsigned char *end = info + sizeof(info);
+
+    while (p + 3 <= end && *p != isc_info_end && *p != isc_info_truncated)
+    {
+      unsigned char item = p[0];
+      unsigned len = p[1] | (p[2] << 8);
+
+      p += 3;
+      if (p + len > end)
+        break;
+      if (item == isc_info_firebird_version)
+      {
+        /* A count, then strings with a length byte; the first one is the
+         * server. */
+        if (len >= 2 && p[1] + 2U <= len)
+          snprintf(version, sizeof(version), "%.*s", (int)p[1],
+                   (const char *)p + 2);
+      }
+      else
+      {
+        long v = 0;
+        for (unsigned i = 0; i < len && i < sizeof(long); i++)
+          v |= (long)p[i] << (8 * i);
+        if (item == isc_info_page_size)
+          page_size = v;
+        else if (item == isc_info_num_buffers)
+          buffers = v;
+        else if (item == isc_info_forced_writes)
+          forced_writes = v;
+      }
+      p += len;
+    }
+  }
+
+  IStatus_init(fbc->st);
+  struct ITransaction *tra = IAttachment_startTransaction(fbc->att, fbc->st,
+                                                          sizeof(tpb), tpb);
+  if (!fb_check_status(fbc->st))
+  {
+    struct IResultSet *curs = IAttachment_openCursor(fbc->att, fbc->st, tra,
+        0, sql, FB_DIALECT, NULL, NULL, NULL, NULL, 0);
+    if (!fb_check_status(fbc->st))
+    {
+      struct IMessageMetadata *meta = IResultSet_getMetadata(curs, fbc->st);
+      if (!fb_check_status(fbc->st))
+      {
+        fb_fetch_all(fbc, curs, meta, &row);
+        IMessageMetadata_release(meta);
+      }
+      fb_close_cursor(curs);
+    }
+    fb_rollback_quiet(&tra);
+  }
+  IStatus_init(fbc->st);
+
+  const char *linger = "?", *protocol = "", *crypt = "?", *compress = "?";
+  if (row != NULL && row->nrows == 1 && row->nfields == 4)
+  {
+    linger = row->values[0].ptr ? row->values[0].ptr : "?";
+    protocol = row->values[1].ptr ? row->values[1].ptr : "";
+    crypt = row->values[2].ptr ? row->values[2].ptr : "?";
+    compress = row->values[3].ptr ? row->values[3].ptr : "?";
+  }
+
+  log_text(LOG_NOTICE, "Firebird server %s: page size %ld, page buffers %ld, "
+           "forced writes %s, LINGER %s s, protocol %s, wire encrypted %s, "
+           "wire compressed %s",
+           version, page_size, buffers,
+           forced_writes < 0 ? "?" : (forced_writes ? "on" : "off"),
+           linger, *protocol ? protocol : "embedded", crypt, compress);
+
+  if (*protocol && strcmp(linger, "0") == 0)
+    log_text(LOG_WARNING, "LINGER is 0: the server closes the database when "
+             "the last connection ends, so every sysbench run starts with a "
+             "cold page cache. Use ALTER DATABASE SET LINGER TO 60.");
+
+  fb_free_result(row);
+}
+
+
 int firebird_drv_connect(db_conn_t *sb_conn)
 {
   fb_conn_t *fbc = (fb_conn_t *)calloc(1, sizeof(fb_conn_t));
@@ -887,6 +1465,12 @@ int firebird_drv_connect(db_conn_t *sb_conn)
   }
 
   fbc->tra = NULL;
+
+  /* One line of server settings for each sysbench run. */
+  if (sb_globals.cmdname != NULL && strcmp(sb_globals.cmdname, "run") == 0 &&
+      __sync_bool_compare_and_swap(&fb_settings_logged, 0, 1))
+    fb_log_server_settings(fbc);
+
   sb_conn->ptr = fbc;
   return 0;
 
@@ -909,11 +1493,12 @@ int firebird_drv_disconnect(db_conn_t *sb_conn)
 
   fb_batch_close(fbc);
 
-  if (fbc->tra != NULL)
-  {
-    ITransaction_rollback(fbc->tra, fbc->st);
-    fbc->tra = NULL;
-  }
+  /* The read transaction has no changes, so commit ends it. An unfinished
+   * explicit or write transaction rolls back, as in MySQL and PostgreSQL
+   * on disconnect. */
+  if (fbc->tra_read != NULL)
+    fb_commit(fbc, &fbc->tra_read);
+  fb_rollback_quiet(&fbc->tra);
 
   if (fbc->att != NULL)
   {
@@ -954,13 +1539,18 @@ int firebird_drv_prepare(db_stmt_t *stmt, const char *query, size_t len)
   if (fbc == NULL)
     return 1;
 
-  if (!use_ps ||
-      strcasecmp(query, "BEGIN") == 0 ||
-      strcasecmp(query, "COMMIT") == 0 ||
-      strcasecmp(query, "ROLLBACK") == 0)
+  int is_txn_control = (strcasecmp(query, "BEGIN") == 0 ||
+                        strcasecmp(query, "COMMIT") == 0 ||
+                        strcasecmp(query, "ROLLBACK") == 0);
+
+  if (!use_ps || is_txn_control)
   {
     stmt->emulated = 1;
     stmt->query = strdup(query);
+    /* Non-NULL only for a SELECT or a plain INSERT/UPDATE/DELETE: its type,
+     * so that fb_query() can use one attachment-level call. */
+    if (!is_txn_control)
+      stmt->ptr = fb_describe_template(fbc, query);
     return 0;
   }
 
@@ -968,11 +1558,14 @@ int firebird_drv_prepare(db_stmt_t *stmt, const char *query, size_t len)
   if (fbstmt == NULL)
     return 1;
 
-  if (fb_ensure_transaction(fbc))
+  /* Prepare needs a transaction but changes nothing: use the read
+   * transaction, so that no write transaction stays open. */
+  struct ITransaction *tra = fb_read_transaction(fbc);
+  if (tra == NULL)
     goto error;
 
   IStatus_init(fbc->st);
-  fbstmt->stmt = IAttachment_prepare(fbc->att, fbc->st, fbc->tra, 0, query,
+  fbstmt->stmt = IAttachment_prepare(fbc->att, fbc->st, tra, 0, query,
                                       FB_DIALECT,
                                       IStatement_PREPARE_PREFETCH_METADATA);
   if (fb_check_status(fbc->st))
@@ -981,6 +1574,7 @@ int firebird_drv_prepare(db_stmt_t *stmt, const char *query, size_t len)
     goto error;
   }
 
+  fbstmt->stmt_type = IStatement_getType(fbstmt->stmt, fbc->st);
   fbstmt->out_meta = IStatement_getOutputMetadata(fbstmt->stmt, fbc->st);
   fbstmt->in_meta = IStatement_getInputMetadata(fbstmt->stmt, fbc->st);
 
@@ -995,7 +1589,8 @@ int firebird_drv_prepare(db_stmt_t *stmt, const char *query, size_t len)
   if (fbstmt->out_buf_len > 0)
   {
     fbstmt->out_buf = (unsigned char *)calloc(1, fbstmt->out_buf_len);
-    if (fbstmt->out_buf == NULL)
+    fbstmt->row0_buf = (unsigned char *)malloc(fbstmt->out_buf_len);
+    if (fbstmt->out_buf == NULL || fbstmt->row0_buf == NULL)
       goto error;
   }
 
@@ -1038,6 +1633,7 @@ error:
     }
     free(fbstmt->cached_values);
     free(fbstmt->out_buf);
+    free(fbstmt->row0_buf);
     free(fbstmt->in_buf);
     if (fbstmt->out_meta) IMessageMetadata_release(fbstmt->out_meta);
     if (fbstmt->in_meta) IMessageMetadata_release(fbstmt->in_meta);
@@ -1187,6 +1783,26 @@ static void fb_set_param(fb_stmt_t *fbstmt, struct IStatus *st,
 }
 
 
+/* End of a prepared SELECT in the cursor path. With
+ * --firebird-autocommit-select the cursor closes now, so that the read
+ * transaction can commit; the rows are already in the result. Returns 0 on
+ * success. */
+static int fb_cursor_done(fb_conn_t *fbc, fb_stmt_t *fbstmt,
+                          struct ITransaction *tra)
+{
+  if (!fb_autocommit_select || tra != fbc->tra_read)
+    return 0;
+
+  if (fbstmt->cursor_open)
+  {
+    fb_close_cursor(fbstmt->cursor);
+    fbstmt->cursor = NULL;
+    fbstmt->cursor_open = 0;
+  }
+  return fb_autocommit_read(fbc, tra);
+}
+
+
 db_error_t firebird_drv_execute(db_stmt_t *stmt, db_result_t *rs)
 {
   db_conn_t *con = stmt->connection;
@@ -1225,14 +1841,77 @@ db_error_t firebird_drv_execute(db_stmt_t *stmt, db_result_t *rs)
     for (i = 0; i < fbstmt->nparams; i++)
       fb_set_param(fbstmt, fbc->st, i, &stmt->bound_param[i]);
 
-    if (fb_ensure_transaction(fbc))
-      return DB_ERROR_FATAL;
+    /* A SELECT outside BEGIN reads in the read transaction; any other
+     * statement runs in the write transaction. */
+    struct ITransaction *tra;
+    if (fbstmt->stmt_type == isc_info_sql_stmt_select)
+    {
+      tra = fb_read_transaction(fbc);
+      if (tra == NULL)
+        return DB_ERROR_FATAL;
+    }
+    else
+    {
+      if (fb_ensure_transaction(fbc))
+        return DB_ERROR_FATAL;
+      tra = fbc->tra;
+    }
+
+    /* A SELECT runs as one IStatement::execute with an output message. The
+     * client sends a single op_execute2 instead of op_free_statement +
+     * op_execute + op_fetch, so the server queues one request instead of
+     * three. The engine runs it as a singleton select: no row gives
+     * isc_stream_eof, more than one row gives isc_sing_select_err. */
+    if (fbstmt->nfields > 0 && fb_select_mode != FB_SELECT_CURSOR &&
+        !fbstmt->multi_row)
+    {
+      IStatus_init(fbc->st);
+      IStatement_execute(fbstmt->stmt, fbc->st, tra,
+          fbstmt->nparams > 0 ? fbstmt->in_meta : NULL,
+          fbstmt->nparams > 0 ? fbstmt->in_buf : NULL,
+          fbstmt->out_meta, fbstmt->out_buf);
+
+      int one_row = !fb_check_status(fbc->st);
+      if (one_row || fb_status_has(fbc->st, isc_stream_eof))
+      {
+        if (one_row)
+          for (unsigned ci = 0; ci < fbstmt->nfields; ci++)
+            fb_extract_column_fast(fbstmt->out_meta, fbc->st, fbstmt->out_buf,
+                                    ci, &fbstmt->cached_values[ci],
+                                    fbstmt->conv_bufs[ci]);
+        if (fb_autocommit_read(fbc, tra))
+          return DB_ERROR_FATAL;
+        rs->counter = SB_CNT_READ;
+        rs->nrows = one_row ? 1 : 0;
+        rs->nfields = fbstmt->nfields;
+        rs->ptr = fbstmt;
+        return DB_ERROR_NONE;
+      }
+
+      if (!fb_status_has(fbc->st, isc_sing_select_err))
+        return fb_handle_error(con, fbc, "execute", stmt->query,
+                               &rs->counter);
+
+      if (fb_select_mode == FB_SELECT_SINGLETON)
+      {
+        db_error_t err = fb_handle_error(con, fbc, "execute", stmt->query,
+                                         &rs->counter);
+        log_text(LOG_FATAL, "The SELECT returned more than one row. "
+                 "--firebird-select-mode=singleton allows one row only; use "
+                 "--firebird-select-mode=auto or cursor.");
+        return err;
+      }
+
+      /* auto: this statement can return more than one row, so it uses the
+       * cursor from now on. */
+      fbstmt->multi_row = 1;
+    }
 
     IStatus_init(fbc->st);
 
     if (fbstmt->nfields > 0)
     {
-      fbstmt->cursor = IStatement_openCursor(fbstmt->stmt, fbc->st, fbc->tra,
+      fbstmt->cursor = IStatement_openCursor(fbstmt->stmt, fbc->st, tra,
           fbstmt->nparams > 0 ? fbstmt->in_meta : NULL,
           fbstmt->nparams > 0 ? fbstmt->in_buf : NULL,
           fbstmt->out_meta, 0);
@@ -1254,16 +1933,15 @@ db_error_t firebird_drv_execute(db_stmt_t *stmt, db_result_t *rs)
                                   ci, &fbstmt->cached_values[ci],
                                   fbstmt->conv_bufs[ci]);
 
-        unsigned char *row0_buf = malloc(fbstmt->out_buf_len);
-        if (row0_buf != NULL)
-          memcpy(row0_buf, fbstmt->out_buf, fbstmt->out_buf_len);
+        memcpy(fbstmt->row0_buf, fbstmt->out_buf, fbstmt->out_buf_len);
 
         int second = IResultSet_fetchNext(fbstmt->cursor, fbc->st,
                                            fbstmt->out_buf);
 
         if (second == IStatus_RESULT_NO_DATA)
         {
-          free(row0_buf);
+          if (fb_cursor_done(fbc, fbstmt, tra))
+            return DB_ERROR_FATAL;
           rs->nrows = 1;
           rs->nfields = fbstmt->nfields;
           rs->ptr = fbstmt;
@@ -1274,17 +1952,13 @@ db_error_t firebird_drv_execute(db_stmt_t *stmt, db_result_t *rs)
         {
           fb_result_t *fbrs = (fb_result_t *)calloc(1, sizeof(fb_result_t));
           if (fbrs == NULL)
-          {
-            free(row0_buf);
             return DB_ERROR_FATAL;
-          }
           unsigned capacity = 64;
           fbrs->nfields = fbstmt->nfields;
           fbrs->values = (db_value_t *)calloc(capacity * fbstmt->nfields,
                                                sizeof(db_value_t));
           if (fbrs->values == NULL)
           {
-            free(row0_buf);
             free(fbrs);
             return DB_ERROR_FATAL;
           }
@@ -1294,12 +1968,11 @@ db_error_t firebird_drv_execute(db_stmt_t *stmt, db_result_t *rs)
           {
             uint32_t col_len = 0;
             char *s = fb_extract_column_alloc(fbstmt->out_meta, fbc->st,
-                row0_buf, ci, &col_len);
+                fbstmt->row0_buf, ci, &col_len);
             fbrs->values[ci].ptr = s;
             fbrs->values[ci].len = col_len;
             fb_result_add_string(fbrs, s);
           }
-          free(row0_buf);
           unsigned nrows = 1;
 
           /* Row 1: extract from current out_buf (second fetch result) */
@@ -1346,6 +2019,19 @@ db_error_t firebird_drv_execute(db_stmt_t *stmt, db_result_t *rs)
             nrows++;
           }
 
+          if (fetch_rc != IStatus_RESULT_NO_DATA)
+          {
+            fb_free_result(fbrs);
+            return fb_handle_error(con, fbc, "fetchNext", stmt->query,
+                                   &rs->counter);
+          }
+
+          if (fb_cursor_done(fbc, fbstmt, tra))
+          {
+            fb_free_result(fbrs);
+            return DB_ERROR_FATAL;
+          }
+
           fbrs->nrows = nrows;
           rs->nrows = nrows;
           rs->nfields = fbstmt->nfields;
@@ -1353,13 +2039,14 @@ db_error_t firebird_drv_execute(db_stmt_t *stmt, db_result_t *rs)
           return DB_ERROR_NONE;
         }
 
-        free(row0_buf);
         return fb_handle_error(con, fbc, "fetchNext", stmt->query,
                                &rs->counter);
       }
 
       if (fetch_rc == IStatus_RESULT_NO_DATA)
       {
+        if (fb_cursor_done(fbc, fbstmt, tra))
+          return DB_ERROR_FATAL;
         rs->nrows = 0;
         rs->nfields = fbstmt->nfields;
         rs->ptr = fbstmt;
@@ -1418,7 +2105,7 @@ db_error_t firebird_drv_execute(db_stmt_t *stmt, db_result_t *rs)
   }
   buf[j] = '\0';
 
-  db_error_t rc = firebird_drv_query(con, buf, j, rs);
+  db_error_t rc = fb_query(con, buf, rs, (fb_stmt_t *)stmt->ptr);
   free(buf);
   return rc;
 }
@@ -1427,9 +2114,110 @@ db_error_t firebird_drv_execute(db_stmt_t *stmt, db_result_t *rs)
 db_error_t firebird_drv_query(db_conn_t *sb_conn, const char *query, size_t len,
                               db_result_t *rs)
 {
-  fb_conn_t *fbc = (fb_conn_t *)sb_conn->ptr;
-
   (void)len;
+
+  return fb_query(sb_conn, query, rs, NULL);
+}
+
+
+/* Error exit of fb_query(): record the error, then roll back the
+ * transaction fb_query() started itself. */
+static db_error_t fb_query_error(db_conn_t *sb_conn, fb_conn_t *fbc,
+                                 const char *func, const char *query,
+                                 db_result_t *rs, int auto_txn)
+{
+  db_error_t err = fb_handle_error(sb_conn, fbc, func, query, &rs->counter);
+  if (auto_txn)
+    fb_rollback_quiet(&fbc->tra);
+  return err;
+}
+
+
+/* Read all rows of an open SELECT cursor into rs and close the cursor.
+ * end_tra, when not NULL, is a transaction that ends with the statement:
+ * it is committed after the rows, or rolled back after an error. */
+static db_error_t fb_query_rows(db_conn_t *sb_conn, fb_conn_t *fbc,
+                                struct IResultSet *curs,
+                                struct IMessageMetadata *out_meta,
+                                const char *query, db_result_t *rs,
+                                struct ITransaction **end_tra)
+{
+  fb_result_t *fbrs = NULL;
+  int frc = fb_fetch_all(fbc, curs, out_meta, &fbrs);
+
+  if (frc != 0)
+  {
+    db_error_t err;
+    if (frc > 0)
+      err = fb_handle_error(sb_conn, fbc, "fetchNext", query, &rs->counter);
+    else
+    {
+      rs->counter = SB_CNT_ERROR;
+      err = DB_ERROR_FATAL;
+    }
+    fb_close_cursor(curs);
+    if (end_tra != NULL)
+      fb_rollback_quiet(end_tra);
+    return err;
+  }
+
+  fb_close_cursor(curs);
+
+  rs->counter = SB_CNT_READ;
+  if (end_tra != NULL && *end_tra != NULL && fb_commit(fbc, end_tra))
+  {
+    fb_free_result(fbrs);
+    return fb_handle_error(sb_conn, fbc, "commit", query, &rs->counter);
+  }
+
+  rs->nrows = fbrs->nrows;
+  rs->nfields = fbrs->nfields;
+  rs->ptr = fbrs;
+
+  return DB_ERROR_NONE;
+}
+
+
+/* CREATE TABLE IF NOT EXISTS and DROP TABLE IF EXISTS. Firebird 5 has no
+ * IF [NOT] EXISTS, so the caller passes the plain statement, and
+ * "unsuccessful metadata update" (SQLCODE -607) means "already done".
+ * Outside a transaction the DDL commits at once, with a new attempt on a
+ * conflict with DDL on other connections. */
+static db_error_t fb_query_ddl_if(fb_conn_t *fbc, const char *sql,
+                                  const char *func, db_result_t *rs)
+{
+  int failed;
+
+  if (fbc->tra == NULL)
+    failed = fb_execute_ddl(fbc, sql);
+  else
+  {
+    IStatus_init(fbc->st);
+    IAttachment_execute(fbc->att, fbc->st, fbc->tra, 0, sql, FB_DIALECT,
+                        NULL, NULL, NULL, NULL);
+    failed = fb_check_status(fbc->st);
+  }
+
+  if (failed && p_isc_sqlcode(IStatus_getErrors(fbc->st)) != -607)
+  {
+    fb_log_error(func, fbc->st);
+    rs->counter = SB_CNT_ERROR;
+    return DB_ERROR_FATAL;
+  }
+
+  rs->counter = SB_CNT_OTHER;
+  rs->nrows = 0;
+  return DB_ERROR_NONE;
+}
+
+
+/* desc holds the type of an emulated prepared SELECT or plain
+ * INSERT/UPDATE/DELETE (see fb_describe_template()). It is NULL for a plain
+ * query() call and for any other statement. */
+static db_error_t fb_query(db_conn_t *sb_conn, const char *query,
+                           db_result_t *rs, fb_stmt_t *desc)
+{
+  fb_conn_t *fbc = (fb_conn_t *)sb_conn->ptr;
 
   sb_conn->sql_errno = 0;
   xfree(sb_conn->sql_state);
@@ -1451,31 +2239,24 @@ db_error_t firebird_drv_query(db_conn_t *sb_conn, const char *query, size_t len,
     if (is_commit)
       fb_batch_close(fbc);
 
-    if (fbc->tra != NULL)
+    if (is_rollback)
+      fb_rollback_quiet(&fbc->tra);
+    else if (fbc->tra != NULL && fb_commit(fbc, &fbc->tra))
     {
-      IStatus_init(fbc->st);
-      if (is_rollback)
-        ITransaction_rollback(fbc->tra, fbc->st);
-      else
-        ITransaction_commit(fbc->tra, fbc->st);
-      fbc->tra = NULL;
-      if (!is_rollback && fb_check_status(fbc->st))
-      {
-        fb_log_error(is_commit ? "commit" : "commit(implicit in BEGIN)",
-                     fbc->st);
-        rs->counter = SB_CNT_ERROR;
-        return DB_ERROR_FATAL;
-      }
+      fb_log_error(is_commit ? "commit" : "commit(implicit in BEGIN)",
+                   fbc->st);
+      fbc->in_explicit_txn = 0;
+      rs->counter = SB_CNT_ERROR;
+      return DB_ERROR_FATAL;
     }
 
     if (!is_commit && !is_rollback)
     {
-      IStatus_init(fbc->st);
-      fbc->tra = IAttachment_startTransaction(fbc->att, fbc->st, 0, NULL);
-      if (fb_check_status(fbc->st))
+      fb_end_read_transaction(fbc);
+      fbc->tra = fb_start_transaction(fbc, &fb_begin_tpb);
+      if (fbc->tra == NULL)
       {
         fb_log_error("startTransaction", fbc->st);
-        fbc->tra = NULL;
         rs->counter = SB_CNT_ERROR;
         return DB_ERROR_FATAL;
       }
@@ -1507,43 +2288,8 @@ db_error_t firebird_drv_query(db_conn_t *sb_conn, const char *query, size_t len,
       char create_buf[4096];
       snprintf(create_buf, sizeof(create_buf), "CREATE TABLE %s", q + 27);
 
-      int auto_txn = (fbc->tra == NULL);
-      if (auto_txn && fb_ensure_transaction(fbc))
-      {
-        rs->counter = SB_CNT_ERROR;
-        return DB_ERROR_FATAL;
-      }
-
-      IStatus_init(fbc->st);
-      IAttachment_execute(fbc->att, fbc->st, fbc->tra, 0, create_buf,
-                          FB_DIALECT, NULL, NULL, NULL, NULL);
-
-      if (fb_check_status(fbc->st))
-      {
-        long sqlcode = p_isc_sqlcode(IStatus_getErrors(fbc->st));
-        if (sqlcode == -607)
-        {
-          if (auto_txn)
-          {
-            struct IStatus *rst = IMaster_getStatus(fb_master);
-            ITransaction_rollback(fbc->tra, rst);
-            IStatus_dispose(rst);
-            fbc->tra = NULL;
-          }
-          rs->counter = SB_CNT_OTHER;
-          rs->nrows = 0;
-          return DB_ERROR_NONE;
-        }
-        fb_log_error("execute(CREATE IF NOT EXISTS)", fbc->st);
-        if (auto_txn) { struct IStatus *rst = IMaster_getStatus(fb_master); ITransaction_rollback(fbc->tra, rst); IStatus_dispose(rst); fbc->tra = NULL; }
-        rs->counter = SB_CNT_ERROR;
-        return DB_ERROR_FATAL;
-      }
-
-      if (auto_txn) { ITransaction_commit(fbc->tra, fbc->st); fbc->tra = NULL; }
-      rs->counter = SB_CNT_OTHER;
-      rs->nrows = 0;
-      return DB_ERROR_NONE;
+      return fb_query_ddl_if(fbc, create_buf, "execute(CREATE IF NOT EXISTS)",
+                             rs);
     }
   }
 
@@ -1559,43 +2305,7 @@ db_error_t firebird_drv_query(db_conn_t *sb_conn, const char *query, size_t len,
     char drop_buf[256];
     snprintf(drop_buf, sizeof(drop_buf), "DROP TABLE %s", query + 21);
 
-    int auto_txn = (fbc->tra == NULL);
-    if (auto_txn && fb_ensure_transaction(fbc))
-    {
-      rs->counter = SB_CNT_ERROR;
-      return DB_ERROR_FATAL;
-    }
-
-    IStatus_init(fbc->st);
-    IAttachment_execute(fbc->att, fbc->st, fbc->tra, 0, drop_buf,
-                        FB_DIALECT, NULL, NULL, NULL, NULL);
-
-    if (fb_check_status(fbc->st))
-    {
-      long sqlcode = p_isc_sqlcode(IStatus_getErrors(fbc->st));
-      if (sqlcode == -607)
-      {
-        if (auto_txn)
-        {
-          struct IStatus *rst = IMaster_getStatus(fb_master);
-          ITransaction_rollback(fbc->tra, rst);
-          IStatus_dispose(rst);
-          fbc->tra = NULL;
-        }
-        rs->counter = SB_CNT_OTHER;
-        rs->nrows = 0;
-        return DB_ERROR_NONE;
-      }
-      fb_log_error("execute(DROP IF EXISTS)", fbc->st);
-      if (auto_txn) { struct IStatus *rst = IMaster_getStatus(fb_master); ITransaction_rollback(fbc->tra, rst); IStatus_dispose(rst); fbc->tra = NULL; }
-      rs->counter = SB_CNT_ERROR;
-      return DB_ERROR_FATAL;
-    }
-
-    if (auto_txn) { ITransaction_commit(fbc->tra, fbc->st); fbc->tra = NULL; }
-    rs->counter = SB_CNT_OTHER;
-    rs->nrows = 0;
-    return DB_ERROR_NONE;
+    return fb_query_ddl_if(fbc, drop_buf, "execute(DROP IF EXISTS)", rs);
   }
 
   /* Batch INSERT optimization — detect "INSERT INTO ... VALUES(...)".
@@ -1684,147 +2394,177 @@ regular_query:
     return DB_ERROR_FATAL;
   }
 
-  int auto_txn = (fbc->tra == NULL);
-  if (auto_txn && fb_ensure_transaction(fbc))
+  /* A SELECT of an emulated prepared statement has its values in the SQL
+   * text and is never run again, so it goes through one
+   * IAttachment::openCursor call instead of prepare + openCursor + free.
+   * The engine knows the output format, so none is passed. Outside BEGIN
+   * it reads in the read transaction. */
+  if (desc != NULL && desc->stmt_type == isc_info_sql_stmt_select)
+  {
+    struct ITransaction *tra = fb_read_transaction(fbc);
+    if (tra == NULL)
+    {
+      rs->counter = SB_CNT_ERROR;
+      return DB_ERROR_FATAL;
+    }
+
+    IStatus_init(fbc->st);
+    struct IResultSet *curs = IAttachment_openCursor(fbc->att, fbc->st, tra,
+        0, query, FB_DIALECT, NULL, NULL, NULL, NULL, 0);
+    if (fb_check_status(fbc->st))
+      return fb_handle_error(sb_conn, fbc, "openCursor", query, &rs->counter);
+
+    struct IMessageMetadata *out_meta = IResultSet_getMetadata(curs, fbc->st);
+    if (fb_check_status(fbc->st))
+    {
+      db_error_t err = fb_handle_error(sb_conn, fbc, "getMetadata", query,
+                                       &rs->counter);
+      fb_close_cursor(curs);
+      return err;
+    }
+
+    db_error_t err = fb_query_rows(sb_conn, fbc, curs, out_meta, query, rs,
+                                   fb_read_end(fbc, tra));
+    IMessageMetadata_release(out_meta);
+    return err;
+  }
+
+  /* A plain INSERT, UPDATE or DELETE (emulated prepared statement) runs as
+   * one IAttachment::execute call without messages instead of
+   * prepare + execute + free. */
+  if (desc != NULL && fb_is_dml(desc->stmt_type))
+  {
+    int auto_txn = (fbc->tra == NULL);
+    if (auto_txn && fb_ensure_transaction(fbc))
+    {
+      rs->counter = SB_CNT_ERROR;
+      return DB_ERROR_FATAL;
+    }
+
+    IStatus_init(fbc->st);
+    IAttachment_execute(fbc->att, fbc->st, fbc->tra, 0, query, FB_DIALECT,
+                        NULL, NULL, NULL, NULL);
+
+    if (fb_check_status(fbc->st))
+      return fb_query_error(sb_conn, fbc, "execute", query, rs, auto_txn);
+
+    if (auto_txn && fb_commit(fbc, &fbc->tra))
+      return fb_handle_error(sb_conn, fbc, "commit", query, &rs->counter);
+
+    rs->counter = SB_CNT_WRITE;
+    rs->nrows = 1;
+    rs->ptr = NULL;
+    return DB_ERROR_NONE;
+  }
+
+  /* Anything else prepares first, to learn the statement type. With no
+   * transaction open, prepare in the read transaction: then a SELECT needs
+   * no write transaction at all. */
+  struct ITransaction *prep_tra = fb_read_transaction(fbc);
+  if (prep_tra == NULL)
   {
     rs->counter = SB_CNT_ERROR;
     return DB_ERROR_FATAL;
   }
 
-  /* Try as DML/DDL first via execute */
   IStatus_init(fbc->st);
-
   struct IStatement *tmp_stmt = IAttachment_prepare(fbc->att, fbc->st,
-      fbc->tra, 0, query, FB_DIALECT, IStatement_PREPARE_PREFETCH_METADATA);
+      prep_tra, 0, query, FB_DIALECT, IStatement_PREPARE_PREFETCH_METADATA);
 
   if (fb_check_status(fbc->st))
-  {
-    db_error_t err = fb_handle_error(sb_conn, fbc, "prepare", query,
-                                      &rs->counter);
-    if (auto_txn && fbc->tra)
-    {
-      struct IStatus *rst = IMaster_getStatus(fb_master);
-      ITransaction_rollback(fbc->tra, rst);
-      IStatus_dispose(rst);
-      fbc->tra = NULL;
-    }
-    return err;
-  }
+    return fb_handle_error(sb_conn, fbc, "prepare", query, &rs->counter);
 
+  unsigned stmt_type = IStatement_getType(tmp_stmt, fbc->st);
   struct IMessageMetadata *out_meta = IStatement_getOutputMetadata(tmp_stmt,
                                                                     fbc->st);
   unsigned nfields = IMessageMetadata_getCount(out_meta, fbc->st);
 
-  if (nfields > 0)
+  /* A SELECT reads in the transaction it was prepared in. Anything else
+   * runs in the write transaction, which commits after the statement when
+   * this call started it (auto_txn). end_tra is the transaction that ends
+   * with the statement. */
+  struct ITransaction *tra = prep_tra;
+  struct ITransaction **end_tra = fb_read_end(fbc, tra);
+  int auto_txn = 0;
+
+  if (stmt_type != isc_info_sql_stmt_select)
   {
-    unsigned out_len = IMessageMetadata_getMessageLength(out_meta, fbc->st);
-    unsigned char *out_buf = calloc(1, out_len);
-    if (out_buf == NULL)
+    auto_txn = (fbc->tra == NULL);
+    if (auto_txn && fb_ensure_transaction(fbc))
     {
       IMessageMetadata_release(out_meta);
       IStatement_free(tmp_stmt, fbc->st);
       rs->counter = SB_CNT_ERROR;
       return DB_ERROR_FATAL;
     }
+    tra = fbc->tra;
+    end_tra = auto_txn ? &fbc->tra : NULL;
+  }
 
+  if (nfields > 0)
+  {
     rs->counter = SB_CNT_READ;
 
     IStatus_init(fbc->st);
     struct IResultSet *curs = IStatement_openCursor(tmp_stmt, fbc->st,
-        fbc->tra, NULL, NULL, out_meta, 0);
+        tra, NULL, NULL, out_meta, 0);
 
     if (fb_check_status(fbc->st))
     {
-      free(out_buf);
+      db_error_t err = fb_handle_error(sb_conn, fbc, "openCursor", query,
+                                       &rs->counter);
+      if (end_tra != NULL)
+        fb_rollback_quiet(end_tra);
       IMessageMetadata_release(out_meta);
       IStatement_free(tmp_stmt, fbc->st);
-      if (auto_txn && fbc->tra)
-      {
-        struct IStatus *rst = IMaster_getStatus(fb_master);
-        ITransaction_rollback(fbc->tra, rst);
-        IStatus_dispose(rst);
-        fbc->tra = NULL;
-      }
-      return fb_handle_error(sb_conn, fbc, "openCursor", query, &rs->counter);
+      return err;
     }
 
-    fb_result_t *fbrs = (fb_result_t *)calloc(1, sizeof(fb_result_t));
-    unsigned capacity = 64;
-    unsigned nrows = 0;
-    fbrs->nfields = nfields;
-    fbrs->values = (db_value_t *)calloc(capacity * nfields, sizeof(db_value_t));
-
-    while (IResultSet_fetchNext(curs, fbc->st, out_buf) == IStatus_RESULT_OK)
-    {
-      if (nrows >= capacity)
-      {
-        capacity *= 2;
-        db_value_t *nv = realloc(fbrs->values, capacity * nfields * sizeof(db_value_t));
-        if (nv == NULL) { fb_free_result(fbrs); free(out_buf); IResultSet_close(curs, fbc->st); IMessageMetadata_release(out_meta); IStatement_free(tmp_stmt, fbc->st); rs->counter = SB_CNT_ERROR; return DB_ERROR_FATAL; }
-        fbrs->values = nv;
-      }
-      for (unsigned ci = 0; ci < nfields; ci++)
-      {
-        uint32_t col_len = 0;
-        char *s = fb_extract_column_alloc(out_meta, fbc->st, out_buf, ci,
-                                           &col_len);
-        fbrs->values[nrows * nfields + ci].ptr = s;
-        fbrs->values[nrows * nfields + ci].len = col_len;
-        fb_result_add_string(fbrs, s);
-      }
-      nrows++;
-    }
-
-    fbrs->nrows = nrows;
-    rs->nrows = nrows;
-    rs->nfields = nfields;
-    rs->ptr = fbrs;
-
-    IResultSet_close(curs, fbc->st);
-    free(out_buf);
+    db_error_t err = fb_query_rows(sb_conn, fbc, curs, out_meta, query, rs,
+                                   end_tra);
     IMessageMetadata_release(out_meta);
     IStatement_free(tmp_stmt, fbc->st);
-
-    if (auto_txn)
-    {
-      ITransaction_commit(fbc->tra, fbc->st);
-      fbc->tra = NULL;
-    }
-
-    return DB_ERROR_NONE;
+    return err;
   }
 
   /* DML or DDL */
   IMessageMetadata_release(out_meta);
+
+  /* DDL outside a transaction gets a transaction of its own, with new
+   * attempts on a conflict with DDL on other connections (CREATE INDEX in
+   * a parallel prepare). */
+  if (auto_txn && stmt_type == isc_info_sql_stmt_ddl)
+  {
+    IStatement_free(tmp_stmt, fbc->st);
+    fb_rollback_quiet(&fbc->tra);
+    if (fb_execute_ddl(fbc, query))
+      return fb_handle_error(sb_conn, fbc, "execute", query, &rs->counter);
+
+    rs->counter = SB_CNT_WRITE;
+    rs->nrows = 1;
+    rs->ptr = NULL;
+    return DB_ERROR_NONE;
+  }
 
   IStatus_init(fbc->st);
   IStatement_execute(tmp_stmt, fbc->st, fbc->tra, NULL, NULL, NULL, NULL);
 
   if (fb_check_status(fbc->st))
   {
+    db_error_t err = fb_query_error(sb_conn, fbc, "execute", query, rs,
+                                    auto_txn);
     IStatement_free(tmp_stmt, fbc->st);
-    if (auto_txn && fbc->tra)
-    {
-      struct IStatus *rst = IMaster_getStatus(fb_master);
-      ITransaction_rollback(fbc->tra, rst);
-      IStatus_dispose(rst);
-      fbc->tra = NULL;
-    }
-    return fb_handle_error(sb_conn, fbc, "execute", query, &rs->counter);
+    return err;
   }
 
   IStatement_free(tmp_stmt, fbc->st);
 
+  if (auto_txn && fb_commit(fbc, &fbc->tra))
+    return fb_handle_error(sb_conn, fbc, "commit", query, &rs->counter);
+
   rs->counter = SB_CNT_WRITE;
   rs->nrows = 1;
   rs->ptr = NULL;
-
-  if (auto_txn)
-  {
-    ITransaction_commit(fbc->tra, fbc->st);
-    fbc->tra = NULL;
-  }
-
   return DB_ERROR_NONE;
 }
 
@@ -1919,6 +2659,7 @@ int firebird_drv_close(db_stmt_t *stmt)
   }
   free(fbstmt->cached_values);
   free(fbstmt->out_buf);
+  free(fbstmt->row0_buf);
   free(fbstmt->in_buf);
 
   if (fbstmt->out_meta) IMessageMetadata_release(fbstmt->out_meta);

@@ -1,0 +1,42 @@
+[Earlier design, replaced by v3: singleton IAttachment::execute for SELECTs in both ps-modes. Kept for its measurements.]
+IAttachment::execute for reads — orig (d9df300) vs new (exec-immediate patch)
+Host: ubuntu-1 (LXD VM on clawnuc3), 2 vCPU, 3 GB, Ubuntu 22.04
+Firebird 5.0.5.1878 HQbird, SuperServer, DefaultDbCachePages 50K, LINGER 300
+Client: libfbclient 5.0.5, localhost:/var/lib/sbei/sbtest.fdb (TCPv4, wire crypt on)
+Data: 2 tables x 10000 rows. Client and server share the 2 vCPUs.
+Note: the first matrix below is noisy; see the repeat runs at the end.
+
+Embedded (no network) for reference, oltp_point_select 2 threads, ps-mode=auto, qps:
+  orig 113585 / 118820 / 120081   new 70961 / 65611 / 71449   (about -40%)
+
+=== Correctness over TCP (ei_check.lua, 20 checks)
+new ps-mode=auto: RESULT: 20 checks, 0 failed 
+new ps-mode=disable: RESULT: 20 checks, 0 failed 
+orig ps-mode=auto: RESULT: 20 checks, 0 failed 
+orig ps-mode=disable: FAIL division by zero: no error RESULT: 20 checks, 1 failed 
+
+=== Network round trips per point select (strace, 1 thread, 5000 events)
+bin    mode         sendto   recvfrom   send/query
+orig   auto           5013       5009         1.00
+orig   disable       25007      20005         5.00
+new    auto           5013       5009         1.00
+new    disable       15015      15011         3.00
+
+=== Throughput over TCP (localhost, 10 s per run, FB 5.0.5 SuperServer, 2 vCPU VM)
+script                th mode     |   orig tps   orig qps |    new tps    new qps | new/orig
+oltp_point_select      1 auto     |    6657.94    6657.94 |    6406.82    6406.82 |     -4%  errs o/n=0/0 fatal o/n=0/0
+oltp_point_select      1 disable  |     310.30     310.30 |     335.10     335.10 |     +8%  errs o/n=0/0 fatal o/n=0/0
+oltp_point_select      2 auto     |   10425.30   10425.30 |    7719.34    7719.34 |    -26%  errs o/n=0/0 fatal o/n=0/0
+oltp_point_select      2 disable  |     493.22     493.22 |     486.02     486.02 |     -1%  errs o/n=0/0 fatal o/n=0/0
+select_random_points   2 auto     |    5295.97    5295.97 |    5184.76    5184.76 |     -2%  errs o/n=0/0 fatal o/n=0/0
+select_random_points   2 disable  |     492.92     492.92 |     469.95     469.95 |     -5%  errs o/n=0/0 fatal o/n=0/0
+select_random_ranges   2 auto     |    4147.48    4147.48 |    3807.04    3807.04 |     -8%  errs o/n=0/0 fatal o/n=0/0
+select_random_ranges   2 disable  |     449.58     449.58 |     468.73     468.73 |     +4%  errs o/n=0/0 fatal o/n=0/0
+oltp_read_only         2 auto     |     182.42    2918.79 |     177.80    2844.81 |     -3%  errs o/n=0/0 fatal o/n=0/0
+oltp_read_only         2 disable  |     104.85    1677.64 |      66.80    1068.74 |    -36%  errs o/n=0/0 fatal o/n=0/0
+
+=== Repeat runs, new first then orig (qps)
+rep1 oltp_read_only th=2 disable: new=2329.98 orig=1823.60
+rep1 oltp_point_select th=2 auto: new=10793.51 orig=10702.59
+rep2 oltp_read_only th=2 disable: new=2091.31 orig=1814.34
+rep2 oltp_point_select th=2 auto: new=10625.72 orig=10729.67
