@@ -238,7 +238,7 @@ footer { padding-block: 2.5rem 4rem; color: var(--muted); font-size: .875rem; }
     </a>
     <nav aria-label="Sections">
       <ol>
-        <li><a href="#start"><span class="num">01</span> Quick start</a></li>
+        <li><a href="#start"><span class="num">01</span> Building it</a></li>
         <li><a href="#versions"><span class="num">02</span> Supported versions</a></li>
         <li><a href="#benchmarks"><span class="num">03</span> Benchmarks</a></li>
         <li><a href="#withdrawn"><span class="num">04</span> A withdrawn result</a></li>
@@ -272,19 +272,63 @@ footer { padding-block: 2.5rem 4rem; color: var(--muted); font-size: .875rem; }
       </div>
 
       <section id="start">
-        <h2>Quick start</h2>
+        <h2>Building it</h2>
+
+        <h3>Requirements</h3>
+        <div class="col">
+          <p>sysbench's own dependencies:</p>
+        </div>
+<pre><span class="cmt"># Debian/Ubuntu</span>
+apt -y install make automake libtool pkg-config libaio-dev
+apt -y install libmysqlclient-dev libssl-dev   <span class="cmt"># MySQL/MariaDB support</span>
+apt -y install libpq-dev                       <span class="cmt"># PostgreSQL support</span>
+
+<span class="cmt"># RHEL/CentOS</span>
+yum -y install make automake libtool pkgconfig libaio-devel
+yum -y install mariadb-devel openssl-devel     <span class="cmt"># MySQL/MariaDB support</span>
+yum -y install postgresql-devel                <span class="cmt"># PostgreSQL support</span></pre>
         <div class="col">
           <p>
-            Building needs headers from Firebird 5 or newer — <code>fb_c_api.h</code> first
-            shipped in FB5. The resulting binary still connects to FB3 and FB4 servers.
+            On top of those, the driver needs <strong>Firebird 5 or newer headers</strong>.
+            <code>fb_c_api.h</code> first shipped in FB5; FB3 and FB4 install only the C++
+            interface headers, so they cannot be built against — though the binary still
+            connects to FB3 and FB4 <em>servers</em> at runtime.
+          </p>
+          <p>
+            Distribution packages are generally too old: Debian 13 ships
+            <code>firebird-dev</code> 4.0.5, and most distributions are still on FB3 or FB4.
+            Either install the official tarball from
+            <a href="https://firebirdsql.org/en/firebird-5-0/">firebirdsql.org</a>, which
+            includes <code>include/firebird/</code>, or build Firebird from source — the
+            latter is also what you want if you intend to benchmark several versions side
+            by side.
+          </p>
+          <p>
+            <code>libfbclient.so</code> is not linked at build time. The driver loads it with
+            <code>dlopen</code> at startup, so only headers are needed to compile.
           </p>
         </div>
-<pre><span class="cmt"># build</span>
-./autogen.sh
+
+        <h3>Build and install</h3>
+<pre>./autogen.sh
 ./configure --with-mysql --with-pgsql --with-firebird=/opt/firebird
 make -j$(nproc)
+sudo make install        <span class="cmt"># optional — ./src/sysbench runs from the build tree</span>
 
-<span class="cmt"># prepare, then run</span>
+<span class="cmt"># check what was built</span>
+./src/sysbench --version
+./src/sysbench --help | grep -A5 "firebird options"</pre>
+        <div class="col">
+          <p>
+            <code>--with-firebird</code> takes the installation prefix;
+            <code>--with-firebird-includes</code> and <code>--with-firebird-libs</code> set
+            the paths explicitly if they live somewhere unusual. Add
+            <code>--without-mysql --without-pgsql</code> for a Firebird-only build.
+          </p>
+        </div>
+
+        <h3>Run a benchmark</h3>
+<pre>
 ./src/sysbench ./src/lua/oltp_read_write.lua \
   --db-driver=firebird \
   --firebird-db=localhost:/var/lib/firebird/sbtest.fdb \
