@@ -2,13 +2,14 @@ Source: sysbench
 Section: misc
 Priority: extra
 Maintainer: Alexey Kopytov <akopytov@gmail.com>
-Build-Depends: debhelper, autoconf, automake, libaio-dev, libtool, libmysqlclient-dev | default-libmysqlclient-dev, libpq-dev, pkg-config, python, libssl-dev, libzstd-dev
+Build-Depends: debhelper, autoconf, automake, libaio-dev, libtool, libmysqlclient-dev | default-libmysqlclient-dev, libpq-dev, pkg-config, python3, libssl-dev, libzstd-dev
 Standards-Version: 3.9.5
 Homepage: https://github.com/akopytov/sysbench
 
 Package: sysbench
 Architecture: any
 Depends: ${shlibs:Depends}, ${misc:Depends}
+Suggests: firebird3.0-utils | firebird4.0-utils
 Description: Scriptable database and system performance benchmark
  sysbench is a scriptable multi-threaded benchmark tool based on
  LuaJIT. It is most frequently used for database benchmarks, but can also

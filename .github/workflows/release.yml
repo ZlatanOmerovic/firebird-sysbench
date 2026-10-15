@@ -1,0 +1,165 @@
+name: Release
+
+# Runs on a *firebird* tag to publish packages, and can be dispatched by hand
+# to test the build without cutting a release.
+on:
+  push:
+    tags:
+      - '*firebird*'
+  workflow_dispatch:
+
+env:
+  # The driver needs Firebird 5+ headers, which no distribution packages yet.
+  # The official tarball carries them, so there is no need to build Firebird.
+  FB_TARBALL: https://github.com/FirebirdSQL/firebird/releases/download/v5.0.4/Firebird-5.0.4.1812-0-linux-x64.tar.gz
+
+jobs:
+  deb:
+    name: ${{ matrix.image }}
+    runs-on: ubuntu-24.04
+    container: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [debian:12, debian:13, ubuntu:22.04, ubuntu:24.04]
+    steps:
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential debhelper devscripts fakeroot automake libtool pkg-config \
+            libaio-dev libssl-dev libzstd-dev libpq-dev default-libmysqlclient-dev \
+            curl ca-certificates git xz-utils
+
+      - name: Install Firebird 5 headers
+        run: |
+          curl -sSL -o /tmp/fb.tar.gz "$FB_TARBALL"
+          mkdir -p /tmp/fb && tar xzf /tmp/fb.tar.gz -C /tmp/fb --strip-components=1
+          tar xzf /tmp/fb/buildroot.tar.gz -C /
+          test -f /opt/firebird/include/firebird/fb_c_api.h
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Mark the working tree safe for git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Set the package version
+        run: |
+          VERSION="${GITHUB_REF_NAME}"
+          case "$VERSION" in *firebird*) ;; *) VERSION="1.1.0-firebird.0+$(git rev-parse --short HEAD)" ;; esac
+          # dpkg forbids '-' inside an upstream version with no debian revision
+          DEB_VERSION="$(echo "$VERSION" | tr '-' '~')-1"
+          echo "Building $DEB_VERSION"
+          dch --create --package sysbench --newversion "$DEB_VERSION" \
+              --distribution unstable --force-bad-version \
+              "Firebird driver build from ${GITHUB_REF_NAME}" || \
+          dch --newversion "$DEB_VERSION" --distribution unstable --force-bad-version \
+              "Firebird driver build from ${GITHUB_REF_NAME}"
+
+      - name: Build package
+        run: dpkg-buildpackage -us -uc -b
+
+      - name: Collect artifacts
+        run: |
+          mkdir -p out
+          cp ../*.deb out/
+          distro=$(echo "${{ matrix.image }}" | tr ':' '-')
+          for f in out/*.deb; do mv "$f" "${f%.deb}.${distro}.deb"; done
+          ls -la out/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deb-${{ strategy.job-index }}
+          path: out/*.deb
+
+  rpm:
+    name: ${{ matrix.image }}
+    runs-on: ubuntu-24.04
+    container: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [rockylinux:9, fedora:41]
+    steps:
+      - name: Install build dependencies
+        run: |
+          dnf -y install --allowerasing \
+            rpm-build gcc gcc-c++ make automake libtool pkgconfig \
+            libaio-devel openssl-devel postgresql-devel libzstd-devel \
+            mariadb-connector-c-devel curl tar gzip git findutils
+
+      - name: Install Firebird 5 headers
+        run: |
+          curl -sSL -o /tmp/fb.tar.gz "$FB_TARBALL"
+          mkdir -p /tmp/fb && tar xzf /tmp/fb.tar.gz -C /tmp/fb --strip-components=1
+          tar xzf /tmp/fb/buildroot.tar.gz -C /
+          test -f /opt/firebird/include/firebird/fb_c_api.h
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Mark the working tree safe for git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Build source tarball and RPM
+        run: |
+          VERSION="${GITHUB_REF_NAME}"
+          case "$VERSION" in *firebird*) ;; *) VERSION="1.1.0-firebird.0" ;; esac
+          # rpm forbids '-' in Version; it separates version from release
+          RPM_VERSION="$(echo "$VERSION" | tr '-' '~')"
+          echo "Building $RPM_VERSION"
+
+          ./autogen.sh
+          ./configure --without-mysql --without-pgsql --without-firebird
+          make dist
+          tarball=$(ls sysbench-*.tar.gz | head -1)
+
+          mkdir -p ~/rpmbuild/SOURCES ~/rpmbuild/SPECS
+          cp "$tarball" ~/rpmbuild/SOURCES/
+          # the spec ships a placeholder version and expects the upstream tarball name
+          sed -e "s/^Version:.*/Version:       ${RPM_VERSION}/" \
+              -e "s|^Source0:.*|Source0:       ${tarball}|" \
+              rpm/sysbench.spec > ~/rpmbuild/SPECS/sysbench.spec
+
+          # the generated tarball unpacks as sysbench-1.1.0, not sysbench-$RPM_VERSION
+          sed -i "s/^%setup.*/%setup -q -n sysbench-1.1.0/" ~/rpmbuild/SPECS/sysbench.spec
+
+          rpmbuild -bb ~/rpmbuild/SPECS/sysbench.spec
+
+      - name: Collect artifacts
+        run: |
+          mkdir -p out
+          find ~/rpmbuild/RPMS -name '*.rpm' -exec cp {} out/ \;
+          distro=$(echo "${{ matrix.image }}" | tr ':' '-')
+          for f in out/*.rpm; do mv "$f" "${f%.rpm}.${distro}.rpm"; done
+          ls -la out/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rpm-${{ strategy.job-index }}
+          path: out/*.rpm
+
+  publish:
+    name: Publish release
+    needs: [deb, rpm]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+      - name: Flatten
+        run: |
+          mkdir -p release
+          find dist -type f \( -name '*.deb' -o -name '*.rpm' \) -exec cp {} release/ \;
+          ls -la release/
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          draft: true
+          generate_release_notes: false
