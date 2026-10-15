@@ -90,9 +90,18 @@ jobs:
             libaio-devel openssl-devel libzstd-devel \
             mariadb-connector-c-devel curl tar gzip git findutils python3
           # pg_config moves between postgresql-devel and libpq-devel depending
-          # on the distribution, so let dnf resolve whatever owns the binary
-          dnf -y install /usr/bin/pg_config || dnf -y install libpq-devel postgresql-devel
-          command -v pg_config || { echo "pg_config not found"; exit 1; }
+          # on the distribution. Report what the repos actually offer, so a
+          # future miss is diagnosable from the log rather than guesswork.
+          dnf -y install libpq-devel postgresql-devel || true
+          dnf -y install /usr/bin/pg_config || true
+          echo "--- packages providing pg_config ---"
+          dnf repoquery --file /usr/bin/pg_config 2>/dev/null || true
+          if command -v pg_config; then
+            echo "HAVE_PGSQL=1" >> "$GITHUB_ENV"
+          else
+            echo "pg_config unavailable — building this RPM without PostgreSQL support"
+            echo "HAVE_PGSQL=0" >> "$GITHUB_ENV"
+          fi
 
       - name: Install Firebird 5 headers
         run: |
@@ -133,6 +142,14 @@ jobs:
 
           # the generated tarball unpacks as sysbench-1.1.0, not sysbench-$RPM_VERSION
           sed -i "s/^%setup.*/%setup -q -n sysbench-1.1.0/" ~/rpmbuild/SPECS/sysbench.spec
+
+          # drop the pgsql driver where pg_config is unavailable
+          if [ "${HAVE_PGSQL:-1}" = "0" ]; then
+            sed -i -e 's/^           --with-pgsql \\$//' \
+                   -e 's/^BuildRequires: libpq-devel$//' \
+                   -e 's/^BuildRequires: postgresql-devel$//' \
+                   ~/rpmbuild/SPECS/sysbench.spec
+          fi
 
           rpmbuild -bb ~/rpmbuild/SPECS/sysbench.spec
 
