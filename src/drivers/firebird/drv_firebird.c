@@ -60,6 +60,12 @@
 #ifndef isc_lock_timeout
 # define isc_lock_timeout    335544510L
 #endif
+#ifndef isc_stream_eof
+# define isc_stream_eof      335544374L
+#endif
+#ifndef isc_sing_select_err
+# define isc_sing_select_err 335544652L
+#endif
 
 static sb_arg_t firebird_drv_args[] =
 {
@@ -70,6 +76,11 @@ static sb_arg_t firebird_drv_args[] =
   SB_OPT("firebird-client",
          "Path to libfbclient.so to load at runtime (overrides default)",
          "libfbclient.so", STRING),
+  SB_OPT("firebird-select-mode",
+         "How a prepared SELECT runs: auto (one-row execute; a cursor after "
+         "it returns more than one row), singleton (always one-row execute), "
+         "cursor (openCursor and fetch)",
+         "auto", STRING),
 
   SB_OPT_END
 };
@@ -131,6 +142,9 @@ typedef struct
   char **conv_bufs;
   /* Copy of row 0 while the cursor path fetches row 1 (out_buf_len bytes) */
   unsigned char *row0_buf;
+  /* 1 once the SELECT returned more than one row to a one-row execute: in
+   * --firebird-select-mode=auto it uses the cursor from then on. */
+  char multi_row;
 } fb_stmt_t;
 
 typedef struct
@@ -161,6 +175,15 @@ static char fb_no_batch;
 /* Set by the first connection of the process, which logs the server
  * settings. */
 static int fb_settings_logged;
+
+/* --firebird-select-mode */
+typedef enum
+{
+  FB_SELECT_AUTO,
+  FB_SELECT_SINGLETON,
+  FB_SELECT_CURSOR
+} fb_select_mode_t;
+static fb_select_mode_t fb_select_mode;
 
 static int firebird_drv_init(void);
 static int firebird_drv_describe(drv_caps_t *);
@@ -296,27 +319,31 @@ static int fb_commit(fb_conn_t *fbc, struct ITransaction **tra)
   return 1;
 }
 
+/* 1 if the status vector of st holds the error code, at any position. */
+static int fb_status_has(struct IStatus *st, intptr_t code)
+{
+  const intptr_t *v = IStatus_getErrors(st);
+
+  for (; *v != isc_arg_end; v += (*v == isc_arg_cstring) ? 3 : 2)
+    if (*v == isc_arg_gds && v[1] == code)
+      return 1;
+
+  return 0;
+}
+
 /* 1 if the error in st is a lock or update conflict with another
  * transaction (SQLCODE -901 or -913, or one of those codes after another
  * error such as "unsuccessful metadata update"). A new attempt can avoid
  * it. */
 static int fb_is_conflict(struct IStatus *st)
 {
-  const intptr_t *v = IStatus_getErrors(st);
-  long sqlcode = p_isc_sqlcode(v);
+  long sqlcode = p_isc_sqlcode(IStatus_getErrors(st));
 
-  if (sqlcode == -901 || sqlcode == -913)
-    return 1;
-
-  for (; *v != isc_arg_end; v += (*v == isc_arg_cstring) ? 3 : 2)
-  {
-    if (*v == isc_arg_gds &&
-        (v[1] == isc_deadlock || v[1] == isc_lock_conflict ||
-         v[1] == isc_update_conflict || v[1] == isc_lock_timeout))
-      return 1;
-  }
-
-  return 0;
+  return sqlcode == -901 || sqlcode == -913 ||
+         fb_status_has(st, isc_deadlock) ||
+         fb_status_has(st, isc_lock_conflict) ||
+         fb_status_has(st, isc_update_conflict) ||
+         fb_status_has(st, isc_lock_timeout);
 }
 
 /* Commit the implicit transaction after a successful statement when the
@@ -1002,6 +1029,20 @@ int firebird_drv_init(void)
   args.password = sb_get_value_string("firebird-password");
   args.client = sb_get_value_string("firebird-client");
 
+  const char *select_mode = sb_get_value_string("firebird-select-mode");
+  if (strcasecmp(select_mode, "auto") == 0)
+    fb_select_mode = FB_SELECT_AUTO;
+  else if (strcasecmp(select_mode, "singleton") == 0)
+    fb_select_mode = FB_SELECT_SINGLETON;
+  else if (strcasecmp(select_mode, "cursor") == 0)
+    fb_select_mode = FB_SELECT_CURSOR;
+  else
+  {
+    log_text(LOG_FATAL, "Invalid value for --firebird-select-mode: '%s'. "
+             "Use auto, singleton or cursor.", select_mode);
+    return 1;
+  }
+
   fb_dlhandle = dlopen(args.client, RTLD_NOW | RTLD_GLOBAL);
   if (fb_dlhandle == NULL)
   {
@@ -1601,6 +1642,54 @@ db_error_t firebird_drv_execute(db_stmt_t *stmt, db_result_t *rs)
 
     if (fb_ensure_transaction(fbc))
       return DB_ERROR_FATAL;
+
+    /* A SELECT runs as one IStatement::execute with an output message. The
+     * client sends a single op_execute2 instead of op_free_statement +
+     * op_execute + op_fetch, so the server queues one request instead of
+     * three. The engine runs it as a singleton select: no row gives
+     * isc_stream_eof, more than one row gives isc_sing_select_err. */
+    if (fbstmt->nfields > 0 && fb_select_mode != FB_SELECT_CURSOR &&
+        !fbstmt->multi_row)
+    {
+      IStatus_init(fbc->st);
+      IStatement_execute(fbstmt->stmt, fbc->st, fbc->tra,
+          fbstmt->nparams > 0 ? fbstmt->in_meta : NULL,
+          fbstmt->nparams > 0 ? fbstmt->in_buf : NULL,
+          fbstmt->out_meta, fbstmt->out_buf);
+
+      int one_row = !fb_check_status(fbc->st);
+      if (one_row || fb_status_has(fbc->st, isc_stream_eof))
+      {
+        if (one_row)
+          for (unsigned ci = 0; ci < fbstmt->nfields; ci++)
+            fb_extract_column_fast(fbstmt->out_meta, fbc->st, fbstmt->out_buf,
+                                    ci, &fbstmt->cached_values[ci],
+                                    fbstmt->conv_bufs[ci]);
+        rs->counter = SB_CNT_READ;
+        rs->nrows = one_row ? 1 : 0;
+        rs->nfields = fbstmt->nfields;
+        rs->ptr = fbstmt;
+        return DB_ERROR_NONE;
+      }
+
+      if (!fb_status_has(fbc->st, isc_sing_select_err))
+        return fb_handle_error(con, fbc, "execute", stmt->query,
+                               &rs->counter);
+
+      if (fb_select_mode == FB_SELECT_SINGLETON)
+      {
+        db_error_t err = fb_handle_error(con, fbc, "execute", stmt->query,
+                                         &rs->counter);
+        log_text(LOG_FATAL, "The SELECT returned more than one row. "
+                 "--firebird-select-mode=singleton allows one row only; use "
+                 "--firebird-select-mode=auto or cursor.");
+        return err;
+      }
+
+      /* auto: this statement can return more than one row, so it uses the
+       * cursor from now on. */
+      fbstmt->multi_row = 1;
+    }
 
     IStatus_init(fbc->st);
 
