@@ -8,34 +8,8 @@ SCRIPTS="./src/lua"
 
 DB_DRIVER="${1:-firebird}"
 
-case "$DB_DRIVER" in
-  firebird)
-    DB_ARGS="--firebird-db=${FIREBIRD_DB:-localhost:/tmp/sbtest.fdb} --firebird-user=${FIREBIRD_USER:-SYSDBA} --firebird-password=${FIREBIRD_PASSWORD:-masterkey}"
-    ;;
-  mysql)
-    DB_ARGS="--mysql-user=${MYSQL_USER:-sbtest} --mysql-password=${MYSQL_PASSWORD:-sbtest} --mysql-db=${MYSQL_DB:-sbtest}"
-    ;;
-  pgsql)
-    DB_ARGS="--pgsql-host=${PGSQL_HOST:-localhost} --pgsql-user=${PGSQL_USER:-sbtest} --pgsql-password=${PGSQL_PASSWORD:-sbtest} --pgsql-db=${PGSQL_DB:-sbtest}"
-    ;;
-  *)
-    echo "Usage: $0 [firebird|mysql|pgsql]"
-    exit 1
-    ;;
-esac
-
-# Firebird: let the caller pick the client library, and remember which one
-# will actually be loaded. The driver dlopens "libfbclient.so" through the
-# ldconfig cache by default, so the version measured depends on the loader.
-if [ "$DB_DRIVER" = firebird ]; then
-  if [ -n "${FIREBIRD_CLIENT:-}" ]; then
-    DB_ARGS="$DB_ARGS --firebird-client=$FIREBIRD_CLIENT"
-    FB_CLIENT="$FIREBIRD_CLIENT"
-  else
-    FB_CLIENT=$(ldconfig -p 2>/dev/null | awk '/libfbclient\.so \(/{print $NF; exit}')
-    FB_CLIENT="${FB_CLIENT:-libfbclient.so (not in ldconfig cache)}"
-  fi
-fi
+# Connection arguments (TRANSPORT), warm-up and the results header.
+. "$(dirname "$0")/run_benchmarks_common.sh"
 
 TABLES="${TABLES:-4}"
 TABLE_SIZE="${TABLE_SIZE:-10000}"
@@ -44,7 +18,8 @@ TIME="${TIME:-10}"
 EVENTS="${EVENTS:-10000}"
 
 COMMON="--db-driver=$DB_DRIVER $DB_ARGS --tables=$TABLES --table-size=$TABLE_SIZE"
-RUN_ARGS="--threads=$THREADS --time=$TIME"
+RUN_ARGS="--threads=$THREADS --time=$TIME --warmup-time=$WARMUP"
+PREPARE_ARGS="--threads=$PREPARE_THREADS"
 
 RESULTS_FILE="benchmark_${DB_DRIVER}_$(date +%Y%m%d_%H%M%S).txt"
 
@@ -79,6 +54,9 @@ if ! $SYSBENCH "$SCRIPTS/oltp_read_write.lua" $COMMON --tables=8 cleanup > "$INI
 fi
 rm -f "$INIT_OUT"
 
+firebird_set_linger
+write_settings_header
+
 BENCHMARKS_START=$(date +%s)
 echo "Benchmarks start: $(date)" | tee -a "$RESULTS_FILE"
 echo "========================================" | tee -a "$RESULTS_FILE"
@@ -96,11 +74,11 @@ run_test() {
     $SYSBENCH "$script" --db-driver=$DB_DRIVER $DB_ARGS --threads=$THREADS --events=$EVENTS run 2>&1 | tee -a "$RESULTS_FILE"
   elif [ "$name" = "select_random_points" ] || [ "$name" = "select_random_ranges" ]; then
     $SYSBENCH "$script" --db-driver=$DB_DRIVER $DB_ARGS --tables=1 --table-size=$TABLE_SIZE cleanup > /dev/null 2>&1 || true
-    $SYSBENCH "$script" --db-driver=$DB_DRIVER $DB_ARGS --tables=1 --table-size=$TABLE_SIZE prepare > /dev/null
+    $SYSBENCH "$script" --db-driver=$DB_DRIVER $DB_ARGS --tables=1 --table-size=$TABLE_SIZE $PREPARE_ARGS prepare > /dev/null
     $SYSBENCH "$script" --db-driver=$DB_DRIVER $DB_ARGS --tables=1 --table-size=$TABLE_SIZE $RUN_ARGS run 2>&1 | tee -a "$RESULTS_FILE"
   else
     $SYSBENCH "$script" $COMMON cleanup > /dev/null 2>&1 || true
-    $SYSBENCH "$script" $COMMON prepare > /dev/null
+    $SYSBENCH "$script" $COMMON $PREPARE_ARGS prepare > /dev/null
     $SYSBENCH "$script" $COMMON $RUN_ARGS run 2>&1 | tee -a "$RESULTS_FILE"
   fi
 }
