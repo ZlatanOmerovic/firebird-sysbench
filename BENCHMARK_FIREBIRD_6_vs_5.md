@@ -1,5 +1,11 @@
 # Firebird 6.0 vs Firebird 5.0 — Head-to-Head
 
+> **Note on these results (added 2026-10-15).** They were measured with
+> the driver of that time: Firebird ran every SELECT outside BEGIN in one
+> long read-write snapshot transaction, and each SELECT used `openCursor` +
+> `fetch`. The current driver uses a read-only read committed transaction
+> and a one-row execute for SELECT (see FIREBIRD.md).
+
 Direct comparison of Firebird 5.0.4 (release) vs Firebird 6.0.0.2012 (Initial /
 Trunk build) on the same hardware, same disk, same sysbench driver build.
 
