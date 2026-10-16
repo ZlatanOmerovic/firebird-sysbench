@@ -73,6 +73,53 @@ MON$ISOLATION_MODE: 1 = snapshot, 4 = read committed with read consistency
   new transaction for the second SELECT: true
 
 ########################################################################
+# A change outside BEGIN is the only open transaction of the connection:
+# a prepare and a SELECT leave no read transaction open. Then the garbage
+# collector is not held back. --firebird-autocommit=server runs the change
+# in a read committed transaction with isc_tpb_autocommit. A transaction
+# keeps its MON$ snapshot after commit retaining, so there each statement
+# gets a new transaction (--firebird-autocommit-restart=1).
+########################################################################
+  $ cat >$CRAMTMP/ac.lua <<'EOF'
+  > local TX = "MON$ISOLATION_MODE, MON$AUTO_COMMIT, " ..
+  >   "(SELECT COUNT(*) FROM MON$TRANSACTIONS " ..
+  >   " WHERE MON$ATTACHMENT_ID = CURRENT_CONNECTION) " ..
+  >   "FROM MON$TRANSACTIONS WHERE MON$TRANSACTION_ID = CURRENT_TRANSACTION"
+  > function event()
+  >   local con = sysbench.sql.driver():connect()
+  >   con:query("EXECUTE BLOCK AS BEGIN IF (EXISTS(SELECT 1 FROM RDB$RELATIONS WHERE RDB$RELATION_NAME='AC')) THEN EXECUTE STATEMENT 'DROP TABLE AC'; END")
+  >   con:query("CREATE TABLE ac(what VARCHAR(20), iso INT, ac INT, n INT)")
+  >   local ins = con:prepare("INSERT INTO ac SELECT 'after prepare', " .. TX)
+  >   ins:execute()
+  >   local n = con:query("SELECT COUNT(*) FROM ac"):fetch_row()[1]
+  >   print("rows a SELECT sees after the change: " .. n)
+  >   con:query("INSERT INTO ac SELECT 'after select', " .. TX)
+  >   con:query("BEGIN")
+  >   local rs = con:query("SELECT what, iso, ac, n FROM ac ORDER BY what")
+  >   for i = 1, rs.nrows do
+  >     local r = rs:fetch_row()
+  >     print(string.format("%s: isolation=%s autocommit=%s transactions=%s",
+  >                         r[1], r[2], r[3], r[4]))
+  >   end
+  >   con:query("COMMIT")
+  >   ins:close()
+  >   con:query("DROP TABLE ac")
+  > end
+  > EOF
+  $ sysbench $CRAMTMP/ac.lua --verbosity=1 --events=1 $DB_DRIVER_ARGS run
+  rows a SELECT sees after the change: 1
+  after prepare: isolation=1 autocommit=0 transactions=1
+  after select: isolation=1 autocommit=0 transactions=1
+  $ sysbench $CRAMTMP/ac.lua --verbosity=1 --events=1 $DB_DRIVER_ARGS --firebird-autocommit=server --firebird-autocommit-restart=1 run
+  rows a SELECT sees after the change: 1
+  after prepare: isolation=4 autocommit=1 transactions=1
+  after select: isolation=4 autocommit=1 transactions=1
+  $ sysbench $CRAMTMP/ac.lua --verbosity=1 --events=1 $DB_DRIVER_ARGS --db-ps-mode=disable run
+  rows a SELECT sees after the change: 1
+  after prepare: isolation=1 autocommit=0 transactions=1
+  after select: isolation=1 autocommit=0 transactions=1
+
+########################################################################
 # Invalid values
 ########################################################################
   $ sysbench $CRAMTMP/tpb.lua --verbosity=1 --events=1 $DB_DRIVER_ARGS --firebird-read-tpb=dirty run
@@ -81,5 +128,9 @@ MON$ISOLATION_MODE: 1 = snapshot, 4 = read committed with read consistency
   [1]
   $ sysbench $CRAMTMP/tpb.lua --verbosity=1 --events=1 $DB_DRIVER_ARGS --firebird-write-tpb=rc-ro run
   FATAL: --firebird-write-tpb must allow writes: use snapshot-rw or rc-rw, not 'rc-ro'.
+  FATAL: `thread_run' function failed: * (glob)
+  [1]
+  $ sysbench $CRAMTMP/tpb.lua --verbosity=1 --events=1 $DB_DRIVER_ARGS --firebird-autocommit=sometimes run
+  FATAL: Invalid value for --firebird-autocommit: 'sometimes'. Use client or server.
   FATAL: `thread_run' function failed: * (glob)
   [1]

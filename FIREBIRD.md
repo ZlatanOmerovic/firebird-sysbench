@@ -55,6 +55,8 @@ FB5. FB3 and FB4 install only the C++ interface headers.
 --firebird-autocommit-select  Commit after each SELECT outside BEGIN (default: off)
 --firebird-begin-tpb          TPB that BEGIN starts (default: snapshot-rw)
 --firebird-write-tpb          TPB of a change outside BEGIN (default: snapshot-rw)
+--firebird-autocommit         client | server: who commits a change outside BEGIN (default: client)
+--firebird-autocommit-restart With server: new transaction after N statements (default: 100; 0 = never)
 --firebird-stats              Page and record counters per statement (default: off)
 ```
 
@@ -82,17 +84,59 @@ SELECT has no parameters and is never run again, so it goes through one
 
 | Statement | Transaction | End |
 |---|---|---|
-| SELECT outside BEGIN | the read transaction, `--firebird-read-tpb` (default read-only read committed) | stays open; committed after each SELECT with `--firebird-autocommit-select=on`; ended by BEGIN, by DDL and at disconnect |
-| INSERT, UPDATE, DELETE outside BEGIN | a write transaction, `--firebird-write-tpb` | committed after the statement |
+| SELECT outside BEGIN | the read transaction, `--firebird-read-tpb` (default read-only read committed) | stays open between SELECTs; committed before a statement that changes data, by BEGIN, by DDL and at disconnect; after each SELECT with `--firebird-autocommit-select=on` |
+| Prepare | the read transaction | committed after the prepare, when the prepare started it |
+| INSERT, UPDATE, DELETE outside BEGIN, `--firebird-autocommit=client` | a write transaction, `--firebird-write-tpb` | committed by the driver after the statement |
+| INSERT, UPDATE, DELETE outside BEGIN, `--firebird-autocommit=server` | the autocommit transaction of the connection: read committed with `isc_tpb_autocommit` | the server commits (commit retaining) after each statement; the driver commits it and starts a new one after `--firebird-autocommit-restart` statements, and at BEGIN, DDL and disconnect |
 | DDL outside BEGIN | a transaction of its own | committed after the statement; a lock or update conflict (SQLCODE -901, -913) runs it again, up to 10 times |
 | Any statement after BEGIN | the explicit transaction, `--firebird-begin-tpb` | COMMIT or ROLLBACK |
 
 Why `rc-ro` for the read transaction: each statement sees the last
-committed data, as with autocommit in MySQL and PostgreSQL, and a
-read-only read committed transaction does not hold back garbage
-collection, so it can stay open. The old driver read in one long
-read-write snapshot transaction (`--firebird-read-tpb=snapshot-rw`), which
-did not see new commits.
+committed data, as with autocommit in MySQL and PostgreSQL. The old driver
+read in one long read-write snapshot transaction
+(`--firebird-read-tpb=snapshot-rw`), which did not see new commits.
+
+Why the read transaction ends before each change: in Firebird 5 an open
+transaction keeps the oldest snapshot of the database
+(`MON$OLDEST_SNAPSHOT`) at its start, also a read-only read committed
+one. Then the garbage collector cannot remove the old record versions
+that the updates of the run leave. Update workloads then measure too high
+(`oltp_update_non_index` on cc2: +17 % with Forced Writes on, +10 % to
++81 % with Forced Writes off), and up to 190K old versions stay in the
+tables after a 30 s run. A connection that only reads keeps its read transaction
+open; only writes leave old versions.
+
+### Server autocommit (`--firebird-autocommit=server`)
+
+With `client` (the default), a statement outside BEGIN that changes data
+costs 3 round trips: `op_transaction`, `op_execute`, `op_commit`. MariaDB
+and PostgreSQL need 1. With `server` the statement runs in a read
+committed transaction with `isc_tpb_autocommit`: the server commits after
+each statement that changes data, and the client sends only `op_execute`.
+The isolation is read committed with read consistency;
+`--firebird-write-tpb` does not apply.
+
+Commit retaining keeps the oldest snapshot of the transaction start, as
+an open read transaction does. So the driver commits the autocommit
+transaction and starts a new one after `--firebird-autocommit-restart`
+statements (default 100): 2 more round trips per 100 statements, and the
+garbage collector stays at most about 100 x threads transactions behind.
+`--firebird-autocommit-restart=0` never ends it; do not publish results
+with it, because garbage collection stops for the whole run.
+
+Measured on cc2 (TPS, 4 x 1M rows, golden copy per case,
+`results/2026-10-16/writes_b1_b3_cc2.txt`):
+
+| Workload | Forced Writes | Threads | client | server |
+|---|---|---|---|---|
+| `oltp_update_non_index` | on | 4 / 16 | 655 / 676 | 670 / 645 |
+| `oltp_update_non_index` | off, file system cache | 1 / 16 | 7 243 / 15 466 | 14 672 / 21 760 |
+| `oltp_insert` | off, file system cache | 1 / 16 | 5 511 / 19 889 | 8 594 / 24 655 |
+
+With Forced Writes ON the disk is the limit, and `server` changes little.
+Without synchronous writes, the round trips are a large part of each
+statement. `server` with restart 0 gave 38.5K TPS for the 16-thread
+update only because garbage collection stopped (189K old versions left).
 
 `--firebird-autocommit-select=on` gives a real autocommit. It is slow in
 Firebird, because `op_transaction` and `op_commit` are not deferred: 3
@@ -120,8 +164,18 @@ Publish both results for `oltp_read_only`.
 - **Warm-up.** Use `--warmup-time` (the scripts use `WARMUP`, default
   10 s).
 - **Settings in the output.** The first connection of a `run` logs one
-  line: server version, page size, page buffers, Forced Writes, LINGER and
-  the wire protocol, and warns when a remote database has LINGER 0.
+  line: server version, page size, page buffers, Forced Writes, the file
+  system cache, LINGER and the wire protocol, and warns when a remote
+  database has LINGER 0. "file system cache off" means `O_DIRECT`: with
+  Forced Writes off each commit still writes its pages to the device, 1.7
+  to 2 times slower than with the cache (`UseFileSystemCache = true`, or a
+  page cache smaller than `FileSystemCacheThreshold`). It shows "?" when
+  the user cannot read `RDB$CONFIG` (administrators only) or the server is
+  older than Firebird 4.
+- **Garbage collection.** Compare update results only from drivers that
+  let the garbage collector work. firebird-sysbench before this change
+  kept a read transaction open for the whole run (see Transactions).
+- **Autocommit.** State `--firebird-autocommit` with the results.
 - **Diagnosis.** `--firebird-stats=on` prints page fetches, page reads,
   page writes, page marks and records read per statement, from the
   database counters (`MON$IO_STATS`, `MON$RECORD_STATS`).
@@ -132,7 +186,7 @@ Publish both results for `oltp_read_only`.
 multi_rows_insert = 0   (Firebird has no multi-row VALUES syntax)
 prepared_statements = 1 (IStatement + IMessageMetadata)
 auto_increment = 0      (uses IDENTITY columns instead)
-needs_commit = 1        (Firebird has no server-side auto-commit)
+needs_commit = 1        (the driver ends transactions; see --firebird-autocommit)
 serial = 0              (not supported)
 unsigned_int = 0        (not supported)
 ```
@@ -163,7 +217,8 @@ Lua DDL branch. The OLTP query templates are unchanged.
 | Auto-increment | `GENERATED BY DEFAULT AS IDENTITY` (FB 3+) in Lua DDL |
 | Parameters | `?` markers — same as MySQL, no conversion needed |
 | Transactions | Driver intercepts `BEGIN`/`COMMIT`/`ROLLBACK` and calls the OO API directly |
-| Auto-commit | Driver commits after each DML and DDL statement unless the caller sent `BEGIN`; a SELECT reads in the read transaction (see Transactions) |
+| Auto-commit | Outside `BEGIN` each DML and DDL statement commits: the driver commits it, or the server with `--firebird-autocommit=server`; a SELECT reads in the read transaction (see Transactions) |
+| SQL text from `con:query()` | An INSERT, UPDATE, DELETE or MERGE without RETURNING runs with one `IAttachment::execute`, without prepare (`oltp_insert`); other text is prepared first to learn its type |
 | Multi-row INSERT | `multi_rows_insert=0`; the driver funnels the per-row INSERTs into `IBatch` |
 | `DROP TABLE IF EXISTS` | `IF EXISTS` stripped, SQLCODE -607 ignored |
 | `CREATE TABLE IF NOT EXISTS` | `IF NOT EXISTS` stripped, SQLCODE -607 ignored |

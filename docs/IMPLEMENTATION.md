@@ -99,7 +99,7 @@ syntax and warns when `--thread-stack-size` is below 2M.
 | `IMaster`, `IProvider`, `IUtil` | Per process | `drv_init` |
 | `IStatus` | Per connection (not thread-safe) | `connect` |
 | `IAttachment` | Per connection | `connect` |
-| `ITransaction` | Per connection: `tra` (explicit or write) and `tra_read` | on demand |
+| `ITransaction` | Per connection: `tra` (explicit or write), `tra_read` and `tra_auto` | on demand |
 
 ### Connection lifecycle
 
@@ -107,7 +107,7 @@ syntax and warns when `--thread-stack-size` is below 2M.
 connect:     IUtil_getXpbBuilder(DPB) → user/password/lc_ctype=UTF8
              → IProvider_attachDatabase()
              → first connection of a `run`: one line of server settings
-disconnect:  flush+close any IBatch → commit tra_read → rollback tra
+disconnect:  flush+close any IBatch → commit tra_read and tra_auto → rollback tra
              → (--firebird-stats, last connection) print the counters
              → IAttachment_detach() → IStatus_dispose()
 reconnect:   disconnect() + connect() loop
@@ -116,36 +116,56 @@ done:        IProvider_release() → dlclose()
 
 ### Transaction handling
 
-Firebird has no server-side auto-commit, so the driver owns transaction
-state. Each connection has two transaction handles:
+The driver owns transaction state. Each connection has three transaction
+handles:
 
 | Handle | Used by | TPB option |
 |---|---|---|
-| `tra` | statements after `BEGIN`; outside `BEGIN`, statements that change data | `--firebird-begin-tpb`, `--firebird-write-tpb` |
+| `tra` | statements after `BEGIN`; outside `BEGIN`, statements that change data with `--firebird-autocommit=client` | `--firebird-begin-tpb`, `--firebird-write-tpb` |
 | `tra_read` | a SELECT outside `BEGIN`; prepare | `--firebird-read-tpb` |
+| `tra_auto` | outside `BEGIN`, statements that change data with `--firebird-autocommit=server` | read committed + `isc_tpb_autocommit` |
 
 `fb_read_transaction()` returns `tra` when it is open (after `BEGIN`, or a
 write transaction not committed yet), else `tra_read`, which stays open
-between statements. `fb_start_transaction()` builds the TPB; a read
-committed TPB asks for read consistency and falls back once to
+between SELECTs. `fb_write_transaction()` returns `tra` when it is open;
+outside `BEGIN` it first ends `tra_read`, then starts `tra` (client) or
+returns `tra_auto` (server). `fb_start_transaction()` builds the TPB; a
+read committed TPB asks for read consistency and falls back once to
 `rec_version` on a Firebird 3 server.
+
+**The read transaction is short.** In Firebird 5 an open transaction keeps
+`MON$OLDEST_SNAPSHOT` at its start, also a read-only read committed one,
+and the garbage collector cannot remove versions newer than that. So
+`tra_read` ends before every statement that changes data, after a prepare
+that started it, at `BEGIN`, before DDL and at disconnect. A prepared
+cursor closes as soon as its rows are read (the close travels with the
+next request), so no open cursor stops the commit.
 
 `firebird_drv_query()` intercepts the three control statements sysbench
 sends as SQL:
 
-- `BEGIN` → commit any open implicit transaction and the read
-  transaction, then start `tra` with `--firebird-begin-tpb`, and set
+- `BEGIN` → commit any open implicit transaction, `tra_read` and
+  `tra_auto`, then start `tra` with `--firebird-begin-tpb`, and set
   `in_explicit_txn`
 - `COMMIT` → close any pending `IBatch`, then `fb_commit()`
 - `ROLLBACK` → `fb_rollback_quiet()`
 
-**Per-statement autocommit.** When no `BEGIN` was sent, `fb_ensure_transaction()`
-opens a write transaction on demand and `fb_autocommit_if_implicit()` commits
-it right after the statement succeeds. This matters for benchmark fairness:
-without it, every insert in a `prepare` run accumulated in one long
-transaction and paid no fsync, which is not what MySQL and PostgreSQL do.
-A SELECT reads in `tra_read` and commits nothing, unless
-`--firebird-autocommit-select` is on.
+**Per-statement autocommit.** When no `BEGIN` was sent, a statement that
+changes data commits:
+
+- `--firebird-autocommit=client` (default): `fb_write_transaction()` starts
+  `tra`, and the caller commits it right after the statement succeeds.
+  3 round trips: `op_transaction`, `op_execute`, `op_commit`.
+- `--firebird-autocommit=server`: the statement runs in `tra_auto`, and the
+  server commits it (commit retaining). 1 round trip. Commit retaining
+  keeps the oldest snapshot of the transaction start, so the driver
+  commits `tra_auto` and starts a new one after
+  `--firebird-autocommit-restart` statements (default 100).
+
+This matters for benchmark fairness: without it, every insert in a
+`prepare` run accumulated in one long transaction and paid no fsync,
+which is not what MySQL and PostgreSQL do. A SELECT reads in `tra_read`
+and commits nothing, unless `--firebird-autocommit-select` is on.
 
 **Every commit is checked** (`fb_commit()`). A failed commit rolls the
 transaction back instead of losing the handle, and the error reaches the
@@ -155,14 +175,16 @@ caller.
 (`fb_execute_ddl()`). Firebird does most DDL work at commit time, so DDL on
 other connections (a parallel `prepare`) can make the commit fail with a
 lock or update conflict; the statement then runs again, up to 10 times.
-`fb_execute_ddl()` first ends `tra_read`: a transaction that has read a
-table keeps it "in use", and `DROP TABLE` on it would fail.
+`fb_execute_ddl()` first ends `tra_read` and `tra_auto`: a transaction
+that has used a table keeps it "in use", and `DROP TABLE` on it would
+fail.
 
 ### Prepared statements
 
 ```
 prepare:      IAttachment_prepare(..., PREPARE_PREFETCH_METADATA) in the
-              read transaction
+              read transaction (committed after, when the prepare
+              started it)
               → IStatement_getType / getInputMetadata / getOutputMetadata
               → allocate flat in/out byte buffers from getMessageLength()
               → allocate per-column conversion buffers (MAX_COLUMN_LENGTH)
@@ -215,7 +237,12 @@ with one attachment-level call:
 
 Over the wire `IAttachment_execute()` is one `op_exec_immediate2` round trip
 instead of prepare + execute. Plain `query()` calls have no template to
-describe, so they always take the generic path.
+describe. `fb_text_is_plain_dml()` reads the first word of their text: an
+INSERT, UPDATE, DELETE or MERGE without the word RETURNING anywhere also
+goes through `IAttachment_execute()` (`oltp_insert` sends its INSERT so:
+5 sends per event before, 3 now, 1 with `--firebird-autocommit=server`).
+Any other text takes the generic path, which prepares it to learn its
+type.
 
 ### Result set handling
 
